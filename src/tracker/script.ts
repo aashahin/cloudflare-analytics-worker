@@ -1,0 +1,97 @@
+// ─── Client-Side Analytics Tracker ───────────────────────────────────────────
+// Lightweight (~1KB minified) tracker script served at GET /tracker.js.
+// Features:
+//   - Auto page view on load
+//   - sendBeacon on visibilitychange for time-on-page
+//   - UTM parameter extraction from URL
+//   - Custom event tracking via window.manhali.track(name)
+//   - Site ID for tenant identification
+//   - No cookies, no localStorage, no fingerprinting on client side
+
+/**
+ * Returns the tracker script as a string.
+ * The script is parameterized with the collect endpoint URL and site ID.
+ *
+ * @param collectEndpoint - Full URL to the /api/collect endpoint
+ * @param siteId - Tenant site ID for attribution (empty string if not provided)
+ */
+export function getTrackerScript(
+  collectEndpoint: string,
+  siteId: string,
+): string {
+  // Sanitize to prevent script injection via query parameters
+  const safeEndpoint = collectEndpoint.replace(/[^a-zA-Z0-9:/_.\.\-]/g, "");
+  const safeSid = siteId.replace(/[^a-zA-Z0-9_\-]/g, "");
+
+  return `(function(){
+"use strict";
+var e="${safeEndpoint}",sid="${safeSid}",t=Date.now(),n=document.referrer,lp=location.pathname,bs=false;
+var _m=new URLSearchParams(location.search),_us=_m.get("utm_source"),_um=_m.get("utm_medium"),_uc=_m.get("utm_campaign");
+
+function s(a,o,en,pp){
+  var d={t:a,p:pp||location.pathname,r:n};
+  if(sid)d.sid=sid;
+  if(o)d.d=o;
+  if(en)d.en=en;
+  if(_us)d.us=_us;
+  if(_um)d.um=_um;
+  if(_uc)d.uc=_uc;
+  try{
+    if(navigator.sendBeacon){
+      navigator.sendBeacon(e,JSON.stringify(d));
+    }else{
+      var x=new XMLHttpRequest();
+      x.open("POST",e,true);
+      x.setRequestHeader("Content-Type","application/json");
+      x.send(JSON.stringify(d));
+    }
+  }catch(err){}
+}
+
+function sendBeacon(){
+  if(bs)return;
+  bs=true;
+  var dur=Math.round((Date.now()-t)/1000);
+  if(dur>0)s("beacon",dur,0,lp);
+}
+
+s("pageview");
+
+document.addEventListener("visibilitychange",function(){
+  if(document.visibilityState==="hidden")sendBeacon();
+});
+window.addEventListener("pagehide",sendBeacon);
+
+function onNav(){
+  if(location.pathname!==lp){
+    sendBeacon();
+    lp=location.pathname;
+    t=Date.now();
+    n="";
+    bs=false;
+    s("pageview");
+  }
+}
+var oP=history.pushState;
+history.pushState=function(){oP.apply(this,arguments);onNav()};
+var oR=history.replaceState;
+history.replaceState=function(){oR.apply(this,arguments);onNav()};
+window.addEventListener("popstate",onNav);
+window.addEventListener("hashchange",onNav);
+
+window.manhali={track:function(name){s("event",0,name||"custom")},pageview:function(){s("pageview")}};
+})();`;
+}
+
+/**
+ * Returns the Content-Type and cache headers for the tracker script.
+ * 1-hour cache with stale-while-revalidate for fast propagation of updates.
+ */
+export function getTrackerHeaders(): HeadersInit {
+  return {
+    "Content-Type": "application/javascript; charset=utf-8",
+    "Cache-Control": "public, max-age=3600, stale-while-revalidate=86400",
+    "Access-Control-Allow-Origin": "*",
+    "X-Content-Type-Options": "nosniff",
+  };
+}
