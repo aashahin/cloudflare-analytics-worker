@@ -13,9 +13,9 @@ const WORKER_URL =
 
 const AUTH_TOKEN =
   process.env.ANALYTICS_AUTH_TOKEN ??
-  "cb56e759a6645950a2d57d92886e5233b7e05797443f60c3106f8eb16b2e3941";
+  "9150c240753973aafe994450b7ef57266c89e674359bc8755c5739f343c22aaf";
 
-const TENANT_ID = "n68fbhzhd76vy1ilxbjgt06q";
+const TENANT_ID = "pddzczoc8i3c22liiyjwnwzl";
 
 // ─── Seed Data Pools ─────────────────────────────────────────────────────────
 
