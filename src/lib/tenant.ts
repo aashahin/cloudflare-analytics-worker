@@ -3,13 +3,14 @@
 
 import type { Env } from "@/env.ts";
 import { verifyIngestAuth } from "@/lib/auth.ts";
+import { type EventType } from "@/lib/schema.ts";
 import { extractHostname, SAFE_TENANT_ID } from "@/lib/utils.ts";
 
 // ─── Collect Payload ─────────────────────────────────────────────────────────
 
 export interface CollectPayload {
   /** Event type: pageview | beacon | event */
-  t: string;
+  t: EventType;
   /** Page path */
   p: string;
   /** Referrer URL (document.referrer from tracker) */
@@ -63,9 +64,36 @@ async function getCachedDomains(
   }
 
   const raw = await getDomainKV(env).get(`domains:${siteId}`);
-  const domains: string[] | null = raw ? JSON.parse(raw) : null;
+  const domains = parseDomainList(raw);
   domainCache.set(siteId, { domains, expiresAt: now + DOMAIN_CACHE_TTL_MS });
   return domains;
+}
+
+export function parseDomainList(raw: string | null): string[] | null {
+  if (!raw) return null;
+
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      Array.isArray(parsed) &&
+      parsed.every((domain) => typeof domain === "string")
+    ) {
+      const normalized = parsed.map((domain) => normalizeHostname(domain));
+      if (normalized.every((domain) => domain !== null)) {
+        return [...new Set(normalized)];
+      }
+    }
+  } catch {
+    // Treat malformed KV values as unregistered domains.
+  }
+
+  return null;
+}
+
+export function normalizeHostname(hostname: string): string | null {
+  const normalized = hostname.trim().toLowerCase().replace(/\.$/, "");
+  if (!normalized || normalized.length > 253) return null;
+  return normalized;
 }
 
 /** Invalidate cached domains for a tenant (call after admin add/remove). */
@@ -87,13 +115,21 @@ export async function resolveTenant(
   request: Request,
   env: Env,
   body: CollectPayload,
-): Promise<{ tenantId: string | null; error?: string }> {
+): Promise<{
+  tenantId: string | null;
+  error?: string;
+  isServerToServer: boolean;
+}> {
   // Server-to-server with Bearer auth — trust body.tid (uses INGEST_TOKEN if set)
   if (body.tid && verifyIngestAuth(request, env)) {
     if (!SAFE_TENANT_ID.test(body.tid)) {
-      return { tenantId: null, error: "Invalid tenant ID format" };
+      return {
+        tenantId: null,
+        error: "Invalid tenant ID format",
+        isServerToServer: false,
+      };
     }
-    return { tenantId: body.tid };
+    return { tenantId: body.tid, isServerToServer: true };
   }
 
   // Client tracker with site ID
@@ -101,18 +137,27 @@ export async function resolveTenant(
   const originHost =
     extractHostname(request.headers.get("Origin")) ??
     extractHostname(request.headers.get("Referer"));
+  const normalizedOriginHost = originHost ? normalizeHostname(originHost) : null;
 
   if (siteId) {
     // Validate format before any KV lookup to avoid wasted reads on garbage input
     if (!SAFE_TENANT_ID.test(siteId)) {
-      return { tenantId: null, error: "Invalid site ID format" };
+      return {
+        tenantId: null,
+        error: "Invalid site ID format",
+        isServerToServer: false,
+      };
     }
     // In production, validate origin against allowed domains for this tenant
     if (env.ENVIRONMENT !== "development") {
       const domains = await getCachedDomains(env, siteId);
       if (domains) {
-        if (!originHost || !domains.includes(originHost)) {
-          return { tenantId: null, error: "Origin not allowed for this site" };
+        if (!normalizedOriginHost || !domains.includes(normalizedOriginHost)) {
+          return {
+            tenantId: null,
+            error: "Origin not allowed for this site",
+            isServerToServer: false,
+          };
         }
       } else if (env.ALLOW_UNREGISTERED_DOMAINS !== "true") {
         console.warn(
@@ -121,6 +166,7 @@ export async function resolveTenant(
         return {
           tenantId: null,
           error: "No domains registered for this site",
+          isServerToServer: false,
         };
       } else {
         console.warn(
@@ -128,13 +174,17 @@ export async function resolveTenant(
         );
       }
     }
-    return { tenantId: siteId };
+    return { tenantId: siteId, isServerToServer: false };
   }
 
   // Development fallback: extract tenant from Origin hostname
   if (env.ENVIRONMENT === "development" && originHost) {
-    return { tenantId: originHost };
+    return { tenantId: originHost, isServerToServer: false };
   }
 
-  return { tenantId: null, error: "Missing sid (site ID) in payload" };
+  return {
+    tenantId: null,
+    error: "Missing sid (site ID) in payload",
+    isServerToServer: false,
+  };
 }

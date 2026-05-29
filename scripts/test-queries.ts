@@ -9,9 +9,7 @@ const WORKER_URL =
     process.env.ANALYTICS_WORKER_URL ??
     "https://manhali-analytics.abshahin.workers.dev";
 
-const AUTH_TOKEN =
-    process.env.ANALYTICS_AUTH_TOKEN ??
-    "cb56e759a6645950a2d57d92886e5233b7e05797443f60c3106f8eb16b2e3941";
+const AUTH_TOKEN = requireEnv("ANALYTICS_AUTH_TOKEN");
 
 const TENANT_ID = "fkeop5c7d4q7gzemgbjhwjlc";
 
@@ -26,6 +24,14 @@ const ROUTES = [
 
 // /api/realtime doesn't take 'days'
 const REALTIME_ROUTE = "/api/realtime";
+
+function requireEnv(name: string): string {
+    const value = process.env[name]?.trim();
+    if (!value) {
+        throw new Error(`${name} is required`);
+    }
+    return value;
+}
 
 async function fetchRoute(route: string, params: Record<string, string>) {
     const url = new URL(`${WORKER_URL}${route}`);

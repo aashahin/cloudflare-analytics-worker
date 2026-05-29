@@ -2,32 +2,6 @@
 // Maps Analytics Engine blob/double slots to semantic field names.
 // Reference: https://developers.cloudflare.com/analytics/analytics-engine/
 
-// ─── Blob Slot Mapping ──────────────────────────────────────────────────────
-
-export const BLOB = {
-  TENANT_ID: "blob1",
-  PAGE_PATH: "blob2",
-  VISITOR_HASH: "blob3",
-  COUNTRY: "blob4",
-  CITY: "blob5",
-  DEVICE_TYPE: "blob6",
-  REFERRER: "blob7",
-  UTM_SOURCE: "blob8",
-  UTM_MEDIUM: "blob9",
-  UTM_CAMPAIGN: "blob10",
-  EVENT_TYPE: "blob11",
-  EVENT_NAME: "blob12",
-} as const;
-
-// ─── Double Slot Mapping ─────────────────────────────────────────────────────
-
-export const DOUBLE = {
-  /** Always 1 — page view counter. Use SUM(_sample_interval) for totals. */
-  PAGE_VIEW: "double1",
-  /** Seconds spent on page (populated via beacon). */
-  TIME_ON_PAGE: "double2",
-} as const;
-
 // ─── Event Types ─────────────────────────────────────────────────────────────
 
 export const EVENT_TYPES = {
@@ -48,24 +22,6 @@ export const DEVICE_TYPES = {
 
 export type DeviceType = (typeof DEVICE_TYPES)[keyof typeof DEVICE_TYPES];
 
-// ─── Data Point Shape ────────────────────────────────────────────────────────
-
-export interface AnalyticsDataPoint {
-  tenantId: string;
-  pagePath: string;
-  visitorHash: string;
-  country: string;
-  city: string;
-  deviceType: DeviceType;
-  referrer: string;
-  utmSource: string;
-  utmMedium: string;
-  utmCampaign: string;
-  eventType: EventType;
-  eventName: string;
-  timeOnPage: number;
-}
-
 // ─── Query Result Types ──────────────────────────────────────────────────────
 
 export interface OverviewStats {
@@ -84,6 +40,7 @@ export interface ReferrerStat {
   referrer: string;
   utmSource: string;
   utmMedium: string;
+  utmCampaign: string;
   views: number;
 }
 

@@ -173,13 +173,14 @@ export async function getTopReferrers(
       blob7 AS referrer,
       blob8 AS utm_source,
       blob9 AS utm_medium,
+      blob10 AS utm_campaign,
       SUM(_sample_interval) AS views
     FROM manhali_analytics
     WHERE blob1 = '${escapeSql(tenantId)}'
       AND blob11 = 'pageview'
       AND timestamp >= NOW() - INTERVAL '${days}' DAY
-      AND blob7 != ''
-    GROUP BY referrer, utm_source, utm_medium
+      AND (blob7 != '' OR blob8 != '' OR blob9 != '' OR blob10 != '')
+    GROUP BY referrer, utm_source, utm_medium, utm_campaign
     ORDER BY views DESC
     LIMIT ${limit}
   `;
@@ -190,6 +191,7 @@ export async function getTopReferrers(
     referrer: String(row.referrer),
     utmSource: String(row.utm_source),
     utmMedium: String(row.utm_medium),
+    utmCampaign: String(row.utm_campaign),
     views: Number(row.views),
   }));
 }
@@ -239,7 +241,7 @@ export async function getDeviceBreakdown(
   days: number = 30,
 ): Promise<DeviceStat[]> {
   validateTenantId(tenantId);
-  days = clampInt(days, 30, 1, 365);
+  days = clampInt(days, 30, 1, 90);
 
   const sql = `
     SELECT

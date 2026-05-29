@@ -5,7 +5,12 @@
 import type { Env } from "@/env.ts";
 import { createScopedToken } from "@/lib/auth.ts";
 import { badRequest, privateJsonResponse } from "@/lib/cors.ts";
-import { getDomainKV, invalidateDomainCache } from "@/lib/tenant.ts";
+import {
+  getDomainKV,
+  invalidateDomainCache,
+  normalizeHostname,
+  parseDomainList,
+} from "@/lib/tenant.ts";
 import { SAFE_TENANT_ID, safeInt } from "@/lib/utils.ts";
 
 /** Pattern for valid hostnames */
@@ -73,7 +78,7 @@ async function handleAdminDomains(
   switch (request.method) {
     case "GET": {
       const raw = await kv.get(key);
-      const domains: string[] = raw ? JSON.parse(raw) : [];
+      const domains = parseDomainList(raw) ?? [];
       return privateJsonResponse(request, { tenantId, domains });
     }
 
@@ -84,17 +89,18 @@ async function handleAdminDomains(
       } catch {
         return badRequest(request, "Invalid JSON body");
       }
+      const domain = normalizeHostname(body.domain ?? "");
       if (
-        !body.domain ||
-        !VALID_HOSTNAME.test(body.domain) ||
-        body.domain.length > 253
+        !domain ||
+        !VALID_HOSTNAME.test(domain) ||
+        domain.length > 253
       ) {
         return badRequest(request, "Missing or invalid domain hostname");
       }
       const raw = await kv.get(key);
-      const domains: string[] = raw ? JSON.parse(raw) : [];
-      if (!domains.includes(body.domain)) {
-        domains.push(body.domain);
+      const domains = parseDomainList(raw) ?? [];
+      if (!domains.includes(domain)) {
+        domains.push(domain);
       }
       await kv.put(key, JSON.stringify(domains));
       invalidateDomainCache(tenantId);
@@ -108,10 +114,13 @@ async function handleAdminDomains(
       } catch {
         return badRequest(request, "Invalid JSON body");
       }
-      if (!body.domain) return badRequest(request, "Missing domain");
+      const domain = normalizeHostname(body.domain ?? "");
+      if (!domain || !VALID_HOSTNAME.test(domain)) {
+        return badRequest(request, "Missing or invalid domain hostname");
+      }
       const raw = await kv.get(key);
-      let domains: string[] = raw ? JSON.parse(raw) : [];
-      domains = domains.filter((d) => d !== body.domain);
+      let domains = parseDomainList(raw) ?? [];
+      domains = domains.filter((d) => d !== domain);
       await kv.put(key, JSON.stringify(domains));
       invalidateDomainCache(tenantId);
       return privateJsonResponse(request, { tenantId, domains });

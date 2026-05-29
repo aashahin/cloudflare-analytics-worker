@@ -6,12 +6,44 @@ import type { Env } from "@/env.ts";
 
 // ─── Timing-Safe Comparison ──────────────────────────────────────────────────
 
+const BEARER_PREFIX = "Bearer ";
+
 export function timingSafeEqual(a: string, b: string): boolean {
   const encoder = new TextEncoder();
   const bufA = encoder.encode(a);
   const bufB = encoder.encode(b);
   if (bufA.byteLength !== bufB.byteLength) return false;
   return crypto.subtle.timingSafeEqual(bufA, bufB);
+}
+
+function readBearerToken(request: Request): string | null {
+  const header = request.headers.get("Authorization");
+  if (!header?.startsWith(BEARER_PREFIX)) return null;
+
+  const token = header.slice(BEARER_PREFIX.length).trim();
+  return token.length > 0 ? token : null;
+}
+
+function configuredSecret(value: string | undefined, name: string): string | null {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    console.error(`[Auth] Required secret ${name} is not configured`);
+    return null;
+  }
+
+  return value;
+}
+
+function optionalConfiguredSecret(
+  value: string | undefined,
+  name: string,
+): string | null {
+  if (value === undefined) return null;
+  if (value.trim().length === 0) {
+    console.error(`[Auth] Optional secret ${name} is configured but empty`);
+    return null;
+  }
+
+  return value;
 }
 
 // ─── Auth Result ─────────────────────────────────────────────────────────────
@@ -26,17 +58,17 @@ export async function verifyAuth(
   request: Request,
   env: Env,
 ): Promise<AuthResult> {
-  const header = request.headers.get("Authorization");
-  if (!header?.startsWith("Bearer ")) return { authenticated: false };
-  const token = header.slice(7);
+  const token = readBearerToken(request);
+  const authSecret = configuredSecret(env.AUTH_TOKEN, "AUTH_TOKEN");
+  if (!token || !authSecret) return { authenticated: false };
 
   // Admin token — unrestricted access to all tenants
-  if (timingSafeEqual(token, env.AUTH_TOKEN)) {
+  if (timingSafeEqual(token, authSecret)) {
     return { authenticated: true };
   }
 
   // Scoped token — restricted to a single tenant
-  const scoped = await verifyScopedToken(token, env.AUTH_TOKEN);
+  const scoped = await verifyScopedToken(token, authSecret);
   if (scoped) {
     return { authenticated: true, tenantScope: scoped.tenantId };
   }
@@ -46,11 +78,13 @@ export async function verifyAuth(
 
 /** Verify server-to-server ingestion auth (uses INGEST_TOKEN if set, else AUTH_TOKEN) */
 export function verifyIngestAuth(request: Request, env: Env): boolean {
-  const header = request.headers.get("Authorization");
-  if (!header?.startsWith("Bearer ")) return false;
-  const token = header.slice(7);
-  if (env.INGEST_TOKEN) return timingSafeEqual(token, env.INGEST_TOKEN);
-  return timingSafeEqual(token, env.AUTH_TOKEN);
+  const token = readBearerToken(request);
+  const authSecret = configuredSecret(env.AUTH_TOKEN, "AUTH_TOKEN");
+  if (!token || !authSecret) return false;
+
+  const ingestSecret =
+    optionalConfiguredSecret(env.INGEST_TOKEN, "INGEST_TOKEN") ?? authSecret;
+  return timingSafeEqual(token, ingestSecret);
 }
 
 // ─── Scoped Tenant Tokens (HMAC-based) ───────────────────────────────────────
@@ -107,8 +141,13 @@ export async function createScopedToken(
   tenantId: string,
   ttlSeconds: number,
 ): Promise<string> {
+  const authSecret = configuredSecret(secret, "AUTH_TOKEN");
+  if (!authSecret) {
+    throw new Error("AUTH_TOKEN is not configured");
+  }
+
   const expiry = Math.floor(Date.now() / 1000) + ttlSeconds;
   const payload = `scoped:${tenantId}:${expiry}`;
-  const hmac = await hmacSign(secret, payload);
+  const hmac = await hmacSign(authSecret, payload);
   return `${payload}:${hmac}`;
 }

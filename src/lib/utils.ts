@@ -28,9 +28,6 @@ export function safeInt(
   return parsed;
 }
 
-/** Validate YYYY-MM-DD date format */
-export const DATE_REGEX = /^\d{4}-\d{2}-\d{2}$/;
-
 /** Pattern for valid tenant IDs — defense-in-depth against injection */
 export const SAFE_TENANT_ID = /^[a-zA-Z0-9_\-.:]+$/;
 

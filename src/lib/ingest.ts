@@ -62,7 +62,7 @@ export async function trackEvent(
 
   const ip = request.headers.get("CF-Connecting-IP") ?? "0.0.0.0";
 
-  // Privacy-safe daily-rotating visitor hash
+  // Privacy-safe visitor hash for unique visitor aggregation
   // Uses a dedicated secret (separate from AUTH_TOKEN for defense in depth)
   const visitorHash = await generateVisitorHash(
     ip,

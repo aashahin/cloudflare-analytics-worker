@@ -21,11 +21,13 @@ export function getTrackerScript(
 ): string {
   // Sanitize to prevent script injection via query parameters
   const safeEndpoint = collectEndpoint.replace(/[^a-zA-Z0-9:/_.\.\-]/g, "");
-  const safeSid = siteId.replace(/[^a-zA-Z0-9_\-]/g, "");
+  const safeSid = siteId.replace(/[^a-zA-Z0-9_\-.:]/g, "");
+  const endpointLiteral = JSON.stringify(safeEndpoint);
+  const sidLiteral = JSON.stringify(safeSid);
 
   return `(function(){
 "use strict";
-var e="${safeEndpoint}",sid="${safeSid}",t=Date.now(),n=document.referrer,lp=location.pathname,bs=false;
+var e=${endpointLiteral},sid=${sidLiteral},t=Date.now(),n=document.referrer,lp=location.pathname,bs=false;
 var _m=new URLSearchParams(location.search),_us=_m.get("utm_source"),_um=_m.get("utm_medium"),_uc=_m.get("utm_campaign");
 
 function s(a,o,en,pp){

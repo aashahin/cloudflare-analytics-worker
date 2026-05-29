@@ -28,7 +28,7 @@ bun install
 
 # Start local dev server
 bun run dev
-# → Wrangler dev (default: http://localhost:8787)
+# → Wrangler dev (configured: http://localhost:8790)
 
 # Run tests
 bun run test
@@ -152,7 +152,7 @@ Query routes require `Authorization: Bearer <token>` and `?tenant_id=`.
 | `GET`  | `/api/geo`       | `days`                              | Country and city breakdown              |
 | `GET`  | `/api/devices`   | `days`                              | Desktop / Mobile / Tablet breakdown     |
 | `GET`  | `/api/realtime`  | —                                   | Visitors active in the last 30 minutes  |
-| `GET`  | `/api/events`    | `days`, `limit`                     | Custom event totals and unique visitors |
+| `GET`  | `/api/events`    | `days`, `limit`                     | Custom event totals and unique daily visitors |
 
 ### Admin API
 
@@ -189,6 +189,8 @@ Tenant resolution priority on collect:
 1. `tid` + valid Bearer token for server-to-server ingestion
 2. `sid` + allowed browser origin for tracker requests
 3. Development fallback to the request origin hostname when `ENVIRONMENT=development`
+
+`wrangler.toml` defaults to `ENVIRONMENT=production` so deployments enforce the KV domain allowlist unless you explicitly override it for local development.
 
 ## Cloudflare Bindings
 

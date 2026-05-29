@@ -3,9 +3,13 @@
 // rate limiting logic, input validation, device parsing, and referrer cleaning.
 
 import { describe, expect, it } from "bun:test";
+import worker from "../src/index.ts";
+import type { Env } from "../src/env.ts";
+import { verifyAuth, verifyIngestAuth } from "../src/lib/auth.ts";
 import { isBot } from "../src/lib/bot-filter.ts";
 import { generateVisitorHash } from "../src/lib/fingerprint.ts";
 import { escapeSql } from "../src/lib/query.ts";
+import { parseDomainList } from "../src/lib/tenant.ts";
 import { cleanReferrer, parseDeviceType } from "../src/lib/ua-parser.ts";
 import { extractHostname } from "../src/lib/utils.ts";
 
@@ -243,3 +247,158 @@ describe("extractHostname", () => {
     expect(extractHostname("http://localhost:3000")).toBe("localhost");
   });
 });
+
+// ─── Domain List Parsing ─────────────────────────────────────────────────────
+
+describe("parseDomainList", () => {
+  it("parses valid domain arrays", () => {
+    expect(parseDomainList(JSON.stringify(["example.com"]))).toEqual([
+      "example.com",
+    ]);
+  });
+
+  it("normalizes domains before caching or comparing", () => {
+    expect(
+      parseDomainList(JSON.stringify(["Example.COM", "www.Example.com."])),
+    ).toEqual(["example.com", "www.example.com"]);
+  });
+
+  it("treats missing or malformed KV values as unregistered", () => {
+    expect(parseDomainList(null)).toBeNull();
+    expect(parseDomainList("not json")).toBeNull();
+    expect(parseDomainList(JSON.stringify({ domain: "example.com" }))).toBeNull();
+    expect(parseDomainList(JSON.stringify(["example.com", 123]))).toBeNull();
+  });
+});
+
+// ─── Auth Guards ──────────────────────────────────────────────────────────────
+
+describe("auth guards", () => {
+  it("rejects blank bearer tokens before comparing secrets", async () => {
+    const env = createMockEnv([]);
+    const request = new Request("https://analytics.example.com/api/overview", {
+      headers: { Authorization: "Bearer " },
+    });
+
+    await expect(verifyAuth(request, env)).resolves.toEqual({
+      authenticated: false,
+    });
+    expect(verifyIngestAuth(request, env)).toBe(false);
+  });
+
+  it("fails closed when AUTH_TOKEN is empty", async () => {
+    const env = { ...createMockEnv([]), AUTH_TOKEN: "" };
+    const request = new Request("https://analytics.example.com/api/overview", {
+      headers: { Authorization: "Bearer admin-secret" },
+    });
+
+    await expect(verifyAuth(request, env)).resolves.toEqual({
+      authenticated: false,
+    });
+    expect(verifyIngestAuth(request, env)).toBe(false);
+  });
+});
+
+// ─── Collect Endpoint ────────────────────────────────────────────────────────
+
+describe("collect endpoint", () => {
+  it("rejects malformed payloads without throwing", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints);
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "https://example.com",
+          "User-Agent": browserUa,
+        },
+        body: JSON.stringify({ t: "pageview", p: 123, sid: "tenant_1" }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(400);
+    expect(dataPoints).toHaveLength(0);
+  });
+
+  it("rejects oversized collect bodies", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints);
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "https://example.com",
+          "User-Agent": browserUa,
+        },
+        body: "x".repeat(65_537),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(413);
+    expect(dataPoints).toHaveLength(0);
+  });
+
+  it("accepts geo overrides only after verified ingest auth", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints);
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer wrong",
+          Origin: "https://example.com",
+          "User-Agent": browserUa,
+          "CF-Connecting-IP": "203.0.113.10",
+        },
+        body: JSON.stringify({
+          t: "pageview",
+          p: "/",
+          sid: "tenant_1",
+          tid: "tenant_1",
+          co: "EG",
+          ci: "Cairo",
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(204);
+    expect(dataPoints).toHaveLength(1);
+    expect(dataPoints[0]?.indexes?.[0]).toBe("tenant_1");
+    expect(dataPoints[0]?.blobs?.[3]).toBe("XX");
+    expect(dataPoints[0]?.blobs?.[4]).toBe("");
+  });
+});
+
+const browserUa =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+function createMockEnv(dataPoints: AnalyticsEngineDataPoint[]): Env {
+  const domainsKv = {
+    get: async () => JSON.stringify(["example.com"]),
+  } as KVNamespace;
+
+  return {
+    ANALYTICS: {
+      writeDataPoint(event?: AnalyticsEngineDataPoint): void {
+        dataPoints.push(event ?? {});
+      },
+    },
+    DOMAINS_KV: domainsKv,
+    AUTH_TOKEN: "admin-secret",
+    CF_API_TOKEN: "cf-secret",
+    FINGERPRINT_SECRET: "fingerprint-secret",
+    INGEST_TOKEN: "ingest-secret",
+    ACCOUNT_ID: "account",
+    ENVIRONMENT: "production",
+    ALLOW_UNREGISTERED_DOMAINS: "false",
+  };
+}

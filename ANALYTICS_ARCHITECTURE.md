@@ -196,7 +196,7 @@ Admin mutations invalidate the in-memory cache for that tenant.
 
 For every accepted collect request the worker performs:
 
-1. Body read and 64 KB size cap
+1. Body read with a streaming 64 KB size cap
 2. JSON parse and required field validation for `t` and `p`
 3. Tenant resolution
 4. Event normalization:
@@ -225,6 +225,8 @@ The worker returns `204 No Content` for successful collect requests.
 - device breakdown
 - realtime visitors
 - custom events
+
+Visitor counts returned as `uniqueVisitors` are unique daily visitors. The underlying visitor hash intentionally rotates every UTC day, so these values should not be interpreted as a cross-day person count.
 
 The query layer validates `tenantId` before embedding it into SQL and escapes single quotes because Analytics Engine SQL is not parameterized.
 
@@ -325,9 +327,9 @@ src/
 
 Analytics Engine retains data for 90 days, so historical queries beyond that window are not available even if callers request longer periods.
 
-### Sampling impact on unique visitors
+### Sampling impact on unique daily visitors
 
-Weighted totals are corrected via `_sample_interval`, but `COUNT(DISTINCT blob3)` still reflects Analytics Engine's sampled dataset under very high traffic volumes.
+Weighted totals are corrected via `_sample_interval`, but `COUNT(DISTINCT blob3)` still reflects Analytics Engine's sampled dataset under very high traffic volumes. `blob3` rotates daily by design, so multi-day queries report unique daily visitors rather than cross-day identity.
 
 ### Non-parameterized SQL API
 

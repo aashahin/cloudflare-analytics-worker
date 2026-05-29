@@ -33,6 +33,8 @@ import { safeInt, sanitizePath } from "@/lib/utils.ts";
 import { handleAdminRoutes } from "@/routes/admin.ts";
 import { getTrackerHeaders, getTrackerScript } from "@/tracker/script.ts";
 
+const MAX_COLLECT_BODY_BYTES = 65_536;
+
 // ─── Worker Export ───────────────────────────────────────────────────────────
 
 export default {
@@ -41,7 +43,6 @@ export default {
   async fetch(
     request: Request,
     env: Env,
-    ctx: ExecutionContext,
   ): Promise<Response> {
     const url = new URL(request.url);
     const { pathname } = url;
@@ -66,7 +67,7 @@ export default {
 
     // Event collection (no auth — called by tracker script from browsers)
     if (pathname === "/api/collect" && method === "POST") {
-      return handleCollect(request, env, ctx);
+      return handleCollect(request, env);
     }
 
     // ── Authenticated API Routes ───────────────────────────────────────────
@@ -166,36 +167,34 @@ export default {
 async function handleCollect(
   request: Request,
   env: Env,
-  ctx: ExecutionContext,
 ): Promise<Response> {
   // Guard against oversized payloads (64 KB limit for analytics)
-  // Read as text first — content-length may be absent (chunked encoding, sendBeacon)
   let rawText: string;
   try {
-    rawText = await request.text();
-  } catch {
+    rawText = await readLimitedText(request, MAX_COLLECT_BODY_BYTES);
+  } catch (error) {
+    if (error instanceof PayloadTooLargeError) {
+      return publicJsonResponse({ error: "Payload too large" }, 413);
+    }
     return publicJsonResponse({ error: "Failed to read body" }, 400);
-  }
-  if (rawText.length > 65_536) {
-    return publicJsonResponse({ error: "Payload too large" }, 413);
   }
 
   let body: CollectPayload;
   try {
-    body = JSON.parse(rawText) as CollectPayload;
-  } catch {
-    return publicJsonResponse({ error: "Invalid JSON" }, 400);
-  }
-
-  if (!body.t || !body.p) {
+    body = parseCollectPayload(rawText);
+  } catch (error) {
     return publicJsonResponse(
-      { error: "Missing required fields: t (type), p (path)" },
+      { error: error instanceof Error ? error.message : "Invalid payload" },
       400,
     );
   }
 
   // ─── Tenant Resolution ───────────────────────────────────────────────────
-  const { tenantId, error } = await resolveTenant(request, env, body);
+  const { tenantId, error, isServerToServer } = await resolveTenant(
+    request,
+    env,
+    body,
+  );
   if (!tenantId) {
     return publicJsonResponse(
       { error: error ?? "Cannot determine tenant" },
@@ -222,12 +221,12 @@ async function handleCollect(
   // Accept country/city overrides only on authenticated server-to-server requests
   // (those use body.tid + Bearer auth — verifyIngestAuth in resolveTenant).
   // Validate country is a plausible 2-letter ISO code.
-  const isS2S = !!(
-    body.tid && request.headers.get("Authorization")?.startsWith("Bearer ")
-  );
   const countryOverride =
-    isS2S && body.co && /^[A-Z]{2}$/.test(body.co) ? body.co : undefined;
-  const cityOverride = isS2S && body.ci ? body.ci.slice(0, 100) : undefined;
+    isServerToServer && body.co && /^[A-Z]{2}$/.test(body.co)
+      ? body.co
+      : undefined;
+  const cityOverride =
+    isServerToServer && body.ci ? body.ci.slice(0, 100) : undefined;
 
   await trackEvent(request, env, {
     tenantId,
@@ -245,4 +244,92 @@ async function handleCollect(
 
   // 204 No Content — minimal response for tracker
   return new Response(null, { status: 204, headers: publicCorsHeaders() });
+}
+
+class PayloadTooLargeError extends Error {}
+
+async function readLimitedText(request: Request, maxBytes: number): Promise<string> {
+  const contentLength = request.headers.get("Content-Length");
+  if (contentLength) {
+    const parsedLength = Number(contentLength);
+    if (Number.isFinite(parsedLength) && parsedLength > maxBytes) {
+      throw new PayloadTooLargeError("Payload too large");
+    }
+  }
+
+  if (!request.body) return "";
+
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let bytesRead = 0;
+  let text = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    bytesRead += value.byteLength;
+    if (bytesRead > maxBytes) {
+      await reader.cancel();
+      throw new PayloadTooLargeError("Payload too large");
+    }
+    text += decoder.decode(value, { stream: true });
+  }
+
+  text += decoder.decode();
+  return text;
+}
+
+function parseCollectPayload(rawText: string): CollectPayload {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(rawText);
+  } catch {
+    throw new Error("Invalid JSON");
+  }
+
+  if (!isRecord(raw)) {
+    throw new Error("Invalid JSON body");
+  }
+
+  if (!isEventType(raw.t)) {
+    throw new Error("Invalid or missing t (type)");
+  }
+
+  if (typeof raw.p !== "string" || raw.p.length === 0) {
+    throw new Error("Missing required field: p (path)");
+  }
+
+  const duration =
+    typeof raw.d === "number" && Number.isFinite(raw.d) ? raw.d : undefined;
+
+  return {
+    t: raw.t,
+    p: raw.p,
+    r: stringOrUndefined(raw.r),
+    d: duration,
+    tid: stringOrUndefined(raw.tid),
+    sid: stringOrUndefined(raw.sid),
+    en: stringOrUndefined(raw.en),
+    us: stringOrUndefined(raw.us),
+    um: stringOrUndefined(raw.um),
+    uc: stringOrUndefined(raw.uc),
+    co: stringOrUndefined(raw.co),
+    ci: stringOrUndefined(raw.ci),
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringOrUndefined(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function isEventType(value: unknown): value is CollectPayload["t"] {
+  return (
+    value === EVENT_TYPES.PAGEVIEW ||
+    value === EVENT_TYPES.BEACON ||
+    value === EVENT_TYPES.EVENT
+  );
 }

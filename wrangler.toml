@@ -2,8 +2,21 @@
 
 name = "manhali-analytics"
 main = "src/index.ts"
-compatibility_date = "2026-03-01"
+account_id = "53fb41ede04e54b276ce3fd9bfd270b6"
+compatibility_date = "2026-05-29"
 compatibility_flags = ["nodejs_compat"]
+
+[[routes]]
+pattern = "analytics.worker.manhali.com"
+zone_name = "manhali.com"
+custom_domain = true
+
+[triggers]
+crons = ["0 0 * * *"]
+
+[observability]
+enabled = true
+head_sampling_rate = 1
 
 # ─── Analytics Engine ─────────────────────────────────────────────────────────
 # Dataset is auto-created on first writeDataPoint() call.
@@ -16,7 +29,7 @@ dataset = "manhali_analytics"
 
 [[kv_namespaces]]
 binding = "DOMAINS_KV"
-id = "#" # Set via `wrangler kv:namespace create --binding=DOMAINS_KV`
+id = "e2809ede5e784984b34d6c85a16465bd"
 
 # ─── Environment variables ────────────────────────────────────────────────────
 # Secrets (set via `wrangler secret put`):
@@ -25,8 +38,8 @@ id = "#" # Set via `wrangler kv:namespace create --binding=DOMAINS_KV`
 #   FINGERPRINT_SECRET  — HMAC secret for visitor hash (separate from AUTH_TOKEN)
 
 [vars]
-ENVIRONMENT = "development"
-ACCOUNT_ID = "#" # Set your Cloudflare account ID here
+ENVIRONMENT = "production"
+ACCOUNT_ID = "53fb41ede04e54b276ce3fd9bfd270b6"
 ALLOW_UNREGISTERED_DOMAINS = "false"
 
 # ─── Dev settings ─────────────────────────────────────────────────────────────

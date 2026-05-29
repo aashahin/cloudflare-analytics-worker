@@ -11,9 +11,7 @@ const WORKER_URL =
   process.env.ANALYTICS_WORKER_URL ??
   "https://manhali-analytics.abshahin.workers.dev";
 
-const AUTH_TOKEN =
-  process.env.ANALYTICS_AUTH_TOKEN ??
-  "9150c240753973aafe994450b7ef57266c89e674359bc8755c5739f343c22aaf";
+const AUTH_TOKEN = requireEnv("ANALYTICS_AUTH_TOKEN");
 
 const TENANT_ID = "pddzczoc8i3c22liiyjwnwzl";
 
@@ -189,6 +187,14 @@ const ARABIC_COUNTRIES: Array<{
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+function requireEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) {
+    throw new Error(`${name} is required`);
+  }
+  return value;
+}
+
 function pick<T>(arr: T[]): T {
   return arr[Math.floor(Math.random() * arr.length)]!;
 }
@@ -223,11 +229,9 @@ interface CollectPayload {
   co?: string;
   /** City override */
   ci?: string;
-  /** Custom simulated timestamp for backdating (optional, backend might ignore in AE) */
-  ts?: string;
 }
 
-function buildPageview(date?: Date): { payload: CollectPayload; ua: string } {
+function buildPageview(): { payload: CollectPayload; ua: string } {
   const deviceType = pickWeighted([
     { value: "desktop" as const, weight: 55 },
     { value: "mobile" as const, weight: 38 },
@@ -264,15 +268,14 @@ function buildPageview(date?: Date): { payload: CollectPayload; ua: string } {
       tid: TENANT_ID,
       co: country.code,
       ci: city,
-      ...(date ? { ts: date.toISOString() } : {}),
       ...utms,
     },
     ua,
   };
 }
 
-function buildBeacon(date?: Date): { payload: CollectPayload; ua: string } {
-  const { payload, ua } = buildPageview(date);
+function buildBeacon(): { payload: CollectPayload; ua: string } {
+  const { payload, ua } = buildPageview();
   return {
     payload: {
       ...payload,
@@ -283,8 +286,8 @@ function buildBeacon(date?: Date): { payload: CollectPayload; ua: string } {
   };
 }
 
-function buildEvent(date?: Date): { payload: CollectPayload; ua: string } {
-  const { payload, ua } = buildPageview(date);
+function buildEvent(): { payload: CollectPayload; ua: string } {
+  const { payload, ua } = buildPageview();
   return {
     payload: {
       ...payload,
@@ -390,40 +393,26 @@ async function main() {
   // ── Build event list ──────────────────────────────────────────────────────
   const events: Array<{ payload: CollectPayload; ua: string }> = [];
 
-  const now = new Date();
-  const DAYS_TO_SEED = 90;
+  // Analytics Engine assigns ingestion time, so this script seeds current data.
+  const pageviews = Math.floor(60 + Math.random() * 20);
+  const beacons = Math.floor(pageviews * (Math.random() * 0.3 + 0.2));
+  const eventsCount = Math.floor(pageviews * (Math.random() * 0.2 + 0.1));
 
-  // Simulate traffic trends over the last 90 days
-  for (let d = DAYS_TO_SEED; d >= 0; d--) {
-    const curDate = new Date(now);
-    curDate.setDate(now.getDate() - d);
-
-    // Simulate varying traffic with a slight upward trend and weekly cycles
-    const baseTraffic = 50;
-    const weeklyCycle = Math.sin((d / 7) * Math.PI) * 10;
-    const upwardTrend = (DAYS_TO_SEED - d) * 0.2;
-    const dailyPageviews = Math.floor(
-      Math.max(5, baseTraffic + weeklyCycle + upwardTrend + (Math.random() * 10 - 5))
-    );
-    const dailyBeacons = Math.floor(dailyPageviews * (Math.random() * 0.3 + 0.2));
-    const dailyEvents = Math.floor(dailyPageviews * (Math.random() * 0.2 + 0.1));
-
-    for (let i = 0; i < dailyPageviews; i++) {
-      events.push(buildPageview(curDate));
-    }
-    for (let i = 0; i < dailyBeacons; i++) {
-      events.push(buildBeacon(curDate));
-    }
-    for (let i = 0; i < dailyEvents; i++) {
-      events.push(buildEvent(curDate));
-    }
+  for (let i = 0; i < pageviews; i++) {
+    events.push(buildPageview());
+  }
+  for (let i = 0; i < beacons; i++) {
+    events.push(buildBeacon());
+  }
+  for (let i = 0; i < eventsCount; i++) {
+    events.push(buildEvent());
   }
 
   // Shuffle
   events.sort(() => Math.random() - 0.5);
 
   console.log(
-    `Generating ${events.length} events over 90 simulated days`,
+    `Generating ${events.length} current-ingestion-time events`,
   );
   console.log(`Sending events without rate limiting...`);
   console.log();
@@ -436,9 +425,9 @@ async function main() {
   console.log();
   console.log();
   console.log("The data should appear in the dashboard analytics page within");
-  console.log("a few seconds. Note: all events have today's real timestamp in AE,");
-  console.log("unless the backend maps the `ts` payload to a custom query logic.");
-  console.log('Use the "7 days" or "30 days" filter to see them.');
+  console.log(
+    "a few seconds. Use the realtime, 7 days, or 30 days filters to see it.",
+  );
 }
 
 main().catch((err) => {
