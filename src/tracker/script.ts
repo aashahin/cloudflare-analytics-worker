@@ -45,13 +45,15 @@ function s(a,o,en,pp){
   if(_um)d.um=_um;
   if(_uc)d.uc=_uc;
   try{
-    if(navigator.sendBeacon){
-      navigator.sendBeacon(e,JSON.stringify(d));
+    var b=JSON.stringify(d);
+    if(navigator.sendBeacon&&navigator.sendBeacon(e,b))return;
+    if(window.fetch){
+      fetch(e,{method:"POST",body:b,keepalive:true,mode:"cors",headers:{"Content-Type":"text/plain;charset=UTF-8"}}).catch(function(){});
     }else{
       var x=new XMLHttpRequest();
       x.open("POST",e,true);
-      x.setRequestHeader("Content-Type","application/json");
-      x.send(JSON.stringify(d));
+      x.setRequestHeader("Content-Type","text/plain;charset=UTF-8");
+      x.send(b);
     }
   }catch(err){}
 }

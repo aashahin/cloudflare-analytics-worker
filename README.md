@@ -88,6 +88,14 @@ bun run deploy
 ### 5. Register tenant domains
 
 Browser-origin collection expects domains to be registered per tenant in production.
+The backend syncs domains when tenants/custom domains are created or changed. For
+existing production tenants, run the backfill once from `apps/backend`:
+
+```bash
+ANALYTICS_WORKER_URL=https://analytics.worker.manhali.com \
+ANALYTICS_AUTH_TOKEN=YOUR_AUTH_TOKEN \
+bun run sync:analytics-domains
+```
 
 ```bash
 curl -X POST "https://analytics.example.com/api/admin/domains?tenant_id=TENANT_ID" \

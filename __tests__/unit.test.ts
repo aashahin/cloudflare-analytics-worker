@@ -16,6 +16,7 @@ import { escapeSql } from "../src/lib/query.ts";
 import { parseDomainList } from "../src/lib/tenant.ts";
 import { cleanReferrer, parseDeviceType } from "../src/lib/ua-parser.ts";
 import { extractHostname } from "../src/lib/utils.ts";
+import { getTrackerScript } from "../src/tracker/script.ts";
 
 // ─── Bot Filter ──────────────────────────────────────────────────────────────
 
@@ -452,6 +453,66 @@ describe("collect endpoint", () => {
     expect(dataPoints[0]?.indexes?.[0]).toBe("tenant_1");
     expect(dataPoints[0]?.blobs?.[3]).toBe("XX");
     expect(dataPoints[0]?.blobs?.[4]).toBe("");
+  });
+
+  it("rejects production browser collection when the tenant has no registered domains", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints, { domains: null });
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain;charset=UTF-8",
+          Origin: "https://example.com",
+          "User-Agent": browserUa,
+        },
+        body: JSON.stringify({
+          t: "pageview",
+          p: "/",
+          sid: "tenant_without_domains",
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: "No domains registered for this site",
+    });
+    expect(dataPoints).toHaveLength(0);
+  });
+
+  it("accepts text/plain browser beacons for registered tenant domains", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints);
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain;charset=UTF-8",
+          Origin: "https://example.com",
+          "User-Agent": browserUa,
+        },
+        body: JSON.stringify({ t: "pageview", p: "/", sid: "tenant_1" }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(204);
+    expect(dataPoints).toHaveLength(1);
+    expect(dataPoints[0]?.indexes?.[0]).toBe("tenant_1");
+  });
+});
+
+describe("tracker script", () => {
+  it("falls back when sendBeacon cannot queue a collect request", () => {
+    const script = getTrackerScript("https://analytics.example.com/api/collect", "tenant_1");
+
+    expect(script).toContain("navigator.sendBeacon&&navigator.sendBeacon(e,b)");
+    expect(script).toContain("keepalive:true");
+    expect(script).toContain("\"Content-Type\":\"text/plain;charset=UTF-8\"");
   });
 });
 
