@@ -27,8 +27,14 @@ export function getTrackerScript(
 
   return `(function(){
 "use strict";
+if(window.manhali)return;
 var e=${endpointLiteral},sid=${sidLiteral},t=Date.now(),n=document.referrer,lp=location.pathname,bs=false;
-var _m=new URLSearchParams(location.search),_us=_m.get("utm_source"),_um=_m.get("utm_medium"),_uc=_m.get("utm_campaign");
+var _us,_um,_uc;
+function utm(){
+  var m=new URLSearchParams(location.search);
+  _us=m.get("utm_source");_um=m.get("utm_medium");_uc=m.get("utm_campaign");
+}
+utm();
 
 function s(a,o,en,pp){
   var d={t:a,p:pp||location.pathname,r:n};
@@ -63,6 +69,11 @@ document.addEventListener("visibilitychange",function(){
   if(document.visibilityState==="hidden")sendBeacon();
 });
 window.addEventListener("pagehide",sendBeacon);
+window.addEventListener("pageshow",function(ev){
+  if(ev.persisted){
+    bs=false;t=Date.now();n="";utm();s("pageview");
+  }
+});
 
 function onNav(){
   if(location.pathname!==lp){
@@ -71,6 +82,7 @@ function onNav(){
     t=Date.now();
     n="";
     bs=false;
+    utm();
     s("pageview");
   }
 }
@@ -79,7 +91,6 @@ history.pushState=function(){oP.apply(this,arguments);onNav()};
 var oR=history.replaceState;
 history.replaceState=function(){oR.apply(this,arguments);onNav()};
 window.addEventListener("popstate",onNav);
-window.addEventListener("hashchange",onNav);
 
 window.manhali={track:function(name){s("event",0,name||"custom")},pageview:function(){s("pageview")}};
 })();`;

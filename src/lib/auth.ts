@@ -13,7 +13,22 @@ export function timingSafeEqual(a: string, b: string): boolean {
   const bufA = encoder.encode(a);
   const bufB = encoder.encode(b);
   if (bufA.byteLength !== bufB.byteLength) return false;
-  return crypto.subtle.timingSafeEqual(bufA, bufB);
+
+  // crypto.subtle.timingSafeEqual is a Cloudflare Workers extension and is used
+  // whenever available (the production runtime). Fall back to a manual
+  // constant-time comparison on runtimes that lack it (e.g. the test env), so
+  // this security-critical primitive stays portable and unit-testable. Lengths
+  // are already equal here, so the loop below is genuinely constant-time.
+  const subtle = crypto.subtle as SubtleCrypto & {
+    timingSafeEqual?: (a: ArrayBufferView, b: ArrayBufferView) => boolean;
+  };
+  if (typeof subtle.timingSafeEqual === "function") {
+    return subtle.timingSafeEqual(bufA, bufB);
+  }
+
+  let diff = 0;
+  for (let i = 0; i < bufA.byteLength; i++) diff |= bufA[i]! ^ bufB[i]!;
+  return diff === 0;
 }
 
 function readBearerToken(request: Request): string | null {

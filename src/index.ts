@@ -29,7 +29,7 @@ import {
 } from "@/lib/query.ts";
 import { EVENT_TYPES } from "@/lib/schema.ts";
 import { type CollectPayload, resolveTenant } from "@/lib/tenant.ts";
-import { safeInt, sanitizePath } from "@/lib/utils.ts";
+import { safeInt, SAFE_TENANT_ID, sanitizePath } from "@/lib/utils.ts";
 import { handleAdminRoutes } from "@/routes/admin.ts";
 import { getTrackerHeaders, getTrackerScript } from "@/tracker/script.ts";
 
@@ -72,10 +72,10 @@ export default {
 
     // ── Authenticated API Routes ───────────────────────────────────────────
 
-    const auth = await verifyAuth(request, env);
-    if (!auth.authenticated) return unauthorized(request);
-
     try {
+      const auth = await verifyAuth(request, env);
+      if (!auth.authenticated) return unauthorized(request);
+
       // ── Admin Routes (require admin token, not scoped tokens) ──────────────
 
       if (pathname.startsWith("/api/admin/")) {
@@ -88,8 +88,15 @@ export default {
       // ── Analytics Query Routes ─────────────────────────────────────────────
 
       const tenantId = url.searchParams.get("tenant_id");
-      if (!tenantId && pathname.startsWith("/api/")) {
-        return badRequest(request, "Missing tenant_id query parameter");
+      if (pathname.startsWith("/api/")) {
+        if (!tenantId) {
+          return badRequest(request, "Missing tenant_id query parameter");
+        }
+        // Validate format up front so a malformed ID yields a 400 rather than
+        // a thrown 500 from validateTenantId deeper in the query layer.
+        if (!SAFE_TENANT_ID.test(tenantId)) {
+          return badRequest(request, "Invalid tenant_id format");
+        }
       }
 
       // Enforce tenant scope — scoped tokens can only query their own tenant
@@ -189,61 +196,78 @@ async function handleCollect(
     );
   }
 
-  // ─── Tenant Resolution ───────────────────────────────────────────────────
-  const { tenantId, error, isServerToServer } = await resolveTenant(
-    request,
-    env,
-    body,
-  );
-  if (!tenantId) {
-    return publicJsonResponse(
-      { error: error ?? "Cannot determine tenant" },
-      400,
+  // resolveTenant reads KV (which can fail transiently) and trackEvent runs the
+  // hash + write; wrap both so a throw returns a CORS-bearing 500 rather than
+  // escaping fetch() as a bare 500 with no Access-Control-Allow-Origin header.
+  try {
+    // ─── Tenant Resolution ─────────────────────────────────────────────────
+    const { tenantId, error, isServerToServer } = await resolveTenant(
+      request,
+      env,
+      body,
     );
+    if (!tenantId) {
+      return publicJsonResponse(
+        { error: error ?? "Cannot determine tenant" },
+        400,
+      );
+    }
+
+    // Map event type
+    const eventType =
+      body.t === "beacon"
+        ? EVENT_TYPES.BEACON
+        : body.t === "event"
+          ? EVENT_TYPES.EVENT
+          : EVENT_TYPES.PAGEVIEW;
+
+    // Sanitize inputs before ingestion
+    const timeOnPage = Math.max(0, Math.min(body.d ?? 0, 3600)); // Clamp 0-3600s
+    const eventName = (body.en ?? "")
+      .replace(/[^a-zA-Z0-9_\-. ]/g, "")
+      .slice(0, 100);
+
+    // Bound UTM fields. Unlike eventName/pagePath/city they are otherwise
+    // written verbatim to blobs 8/9/10; an oversized value (the body cap is
+    // 64 KB, far above AE's 16 KB per-data-point blob budget) would silently
+    // drop the entire data point, and unbounded values bloat GROUP BY
+    // cardinality in getTopReferrers.
+    const utmSource = (body.us ?? "").slice(0, 200);
+    const utmMedium = (body.um ?? "").slice(0, 200);
+    const utmCampaign = (body.uc ?? "").slice(0, 200);
+
+    // trackEvent is async due to the SHA-256 visitor hash computation.
+    // writeDataPoint() inside is fire-and-forget (no await needed for AE write).
+    // Accept country/city overrides only on authenticated server-to-server
+    // requests (those use body.tid + Bearer auth — verifyIngestAuth in
+    // resolveTenant). Validate country is a plausible 2-letter ISO code.
+    const countryOverride =
+      isServerToServer && body.co && /^[A-Z]{2}$/.test(body.co)
+        ? body.co
+        : undefined;
+    const cityOverride =
+      isServerToServer && body.ci ? body.ci.slice(0, 100) : undefined;
+
+    await trackEvent(request, env, {
+      tenantId,
+      pagePath: sanitizePath(body.p),
+      eventType,
+      eventName,
+      timeOnPage,
+      referrer: body.r ?? "",
+      utmSource,
+      utmMedium,
+      utmCampaign,
+      countryOverride,
+      cityOverride,
+    });
+
+    // 204 No Content — minimal response for tracker
+    return new Response(null, { status: 204, headers: publicCorsHeaders() });
+  } catch (error) {
+    console.error("[Collect] Error:", error);
+    return publicJsonResponse({ error: "Internal server error" }, 500);
   }
-
-  // Map event type
-  const eventType =
-    body.t === "beacon"
-      ? EVENT_TYPES.BEACON
-      : body.t === "event"
-        ? EVENT_TYPES.EVENT
-        : EVENT_TYPES.PAGEVIEW;
-
-  // Sanitize inputs before ingestion
-  const timeOnPage = Math.max(0, Math.min(body.d ?? 0, 3600)); // Clamp 0-3600s
-  const eventName = (body.en ?? "")
-    .replace(/[^a-zA-Z0-9_\-. ]/g, "")
-    .slice(0, 100);
-
-  // trackEvent is async due to the SHA-256 visitor hash computation.
-  // writeDataPoint() inside is fire-and-forget (no await needed for AE write).
-  // Accept country/city overrides only on authenticated server-to-server requests
-  // (those use body.tid + Bearer auth — verifyIngestAuth in resolveTenant).
-  // Validate country is a plausible 2-letter ISO code.
-  const countryOverride =
-    isServerToServer && body.co && /^[A-Z]{2}$/.test(body.co)
-      ? body.co
-      : undefined;
-  const cityOverride =
-    isServerToServer && body.ci ? body.ci.slice(0, 100) : undefined;
-
-  await trackEvent(request, env, {
-    tenantId,
-    pagePath: sanitizePath(body.p),
-    eventType,
-    eventName,
-    timeOnPage,
-    referrer: body.r ?? "",
-    utmSource: body.us ?? "",
-    utmMedium: body.um ?? "",
-    utmCampaign: body.uc ?? "",
-    countryOverride,
-    cityOverride,
-  });
-
-  // 204 No Content — minimal response for tracker
-  return new Response(null, { status: 204, headers: publicCorsHeaders() });
 }
 
 class PayloadTooLargeError extends Error {}
