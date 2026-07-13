@@ -5,7 +5,11 @@
 import { describe, expect, it } from "bun:test";
 import worker from "../src/index.ts";
 import type { Env } from "../src/env.ts";
-import { verifyAuth, verifyIngestAuth } from "../src/lib/auth.ts";
+import {
+  createScopedToken,
+  verifyAuth,
+  verifyIngestAuth,
+} from "../src/lib/auth.ts";
 import { isBot } from "../src/lib/bot-filter.ts";
 import { generateVisitorHash } from "../src/lib/fingerprint.ts";
 import { escapeSql } from "../src/lib/query.ts";
@@ -96,26 +100,46 @@ describe("isBot", () => {
 // ─── Fingerprint ─────────────────────────────────────────────────────────────
 
 describe("generateVisitorHash", () => {
+  const DAY = "2026-01-01";
+
   it("generates a 64-char hex string (SHA-256)", async () => {
-    const hash = await generateVisitorHash("1.2.3.4", "Mozilla/5.0", "secret");
+    const hash = await generateVisitorHash(
+      "tenant",
+      "1.2.3.4",
+      "Mozilla/5.0",
+      DAY,
+      "secret",
+    );
     expect(hash).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it("produces consistent output for same inputs", async () => {
-    const a = await generateVisitorHash("1.2.3.4", "Mozilla/5.0", "secret");
-    const b = await generateVisitorHash("1.2.3.4", "Mozilla/5.0", "secret");
+    const a = await generateVisitorHash("tenant", "1.2.3.4", "Mozilla/5.0", DAY, "secret");
+    const b = await generateVisitorHash("tenant", "1.2.3.4", "Mozilla/5.0", DAY, "secret");
     expect(a).toBe(b);
   });
 
   it("produces different hashes for different IPs", async () => {
-    const a = await generateVisitorHash("1.2.3.4", "Mozilla/5.0", "secret");
-    const b = await generateVisitorHash("5.6.7.8", "Mozilla/5.0", "secret");
+    const a = await generateVisitorHash("tenant", "1.2.3.4", "Mozilla/5.0", DAY, "secret");
+    const b = await generateVisitorHash("tenant", "5.6.7.8", "Mozilla/5.0", DAY, "secret");
     expect(a).not.toBe(b);
   });
 
   it("produces different hashes for different secrets", async () => {
-    const a = await generateVisitorHash("1.2.3.4", "Mozilla/5.0", "secret1");
-    const b = await generateVisitorHash("1.2.3.4", "Mozilla/5.0", "secret2");
+    const a = await generateVisitorHash("tenant", "1.2.3.4", "Mozilla/5.0", DAY, "secret1");
+    const b = await generateVisitorHash("tenant", "1.2.3.4", "Mozilla/5.0", DAY, "secret2");
+    expect(a).not.toBe(b);
+  });
+
+  it("is tenant-scoped: same visitor differs across tenants", async () => {
+    const a = await generateVisitorHash("tenantA", "1.2.3.4", "Mozilla/5.0", DAY, "secret");
+    const b = await generateVisitorHash("tenantB", "1.2.3.4", "Mozilla/5.0", DAY, "secret");
+    expect(a).not.toBe(b);
+  });
+
+  it("rotates daily: same visitor differs across UTC days", async () => {
+    const a = await generateVisitorHash("tenant", "1.2.3.4", "Mozilla/5.0", "2026-01-01", "secret");
+    const b = await generateVisitorHash("tenant", "1.2.3.4", "Mozilla/5.0", "2026-01-02", "secret");
     expect(a).not.toBe(b);
   });
 });
@@ -299,6 +323,59 @@ describe("auth guards", () => {
   });
 });
 
+// ─── Scoped Tokens (HMAC) ─────────────────────────────────────────────────────
+
+describe("scoped tokens", () => {
+  function bearer(token: string): Request {
+    return new Request("https://analytics.example.com/api/overview", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  }
+
+  it("mints a token that verifyAuth resolves to the correct tenant scope", async () => {
+    const env = createMockEnv([]);
+    const token = await createScopedToken(env.AUTH_TOKEN, "tenant_42", 3600);
+    await expect(verifyAuth(bearer(token), env)).resolves.toEqual({
+      authenticated: true,
+      tenantScope: "tenant_42",
+    });
+  });
+
+  it("rejects an expired token", async () => {
+    const env = createMockEnv([]);
+    const token = await createScopedToken(env.AUTH_TOKEN, "tenant_42", -100);
+    await expect(verifyAuth(bearer(token), env)).resolves.toEqual({
+      authenticated: false,
+    });
+  });
+
+  it("rejects a token with a tampered HMAC", async () => {
+    const env = createMockEnv([]);
+    const token = await createScopedToken(env.AUTH_TOKEN, "tenant_42", 3600);
+    const flipped = token.slice(0, -1) + (token.endsWith("a") ? "b" : "a");
+    await expect(verifyAuth(bearer(flipped), env)).resolves.toEqual({
+      authenticated: false,
+    });
+  });
+
+  it("rejects a token signed with a different secret", async () => {
+    const env = createMockEnv([]);
+    const token = await createScopedToken("some-other-secret", "tenant_42", 3600);
+    await expect(verifyAuth(bearer(token), env)).resolves.toEqual({
+      authenticated: false,
+    });
+  });
+
+  it("round-trips a tenant ID containing colons", async () => {
+    const env = createMockEnv([]);
+    const token = await createScopedToken(env.AUTH_TOKEN, "org:team:1", 3600);
+    await expect(verifyAuth(bearer(token), env)).resolves.toEqual({
+      authenticated: true,
+      tenantScope: "org:team:1",
+    });
+  });
+});
+
 // ─── Collect Endpoint ────────────────────────────────────────────────────────
 
 describe("collect endpoint", () => {
@@ -378,12 +455,75 @@ describe("collect endpoint", () => {
   });
 });
 
+// ─── Domain Allowlist Enforcement (collect) ──────────────────────────────────
+
+describe("domain allowlist on collect", () => {
+  // Each test uses a unique sid so the module-level per-isolate domain cache
+  // (keyed by sid) never leaks a previous test's allowlist into this one.
+  function collect(
+    env: Env,
+    origin: string,
+    sid: string,
+  ): Promise<Response> {
+    return worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: origin,
+          "User-Agent": browserUa,
+        },
+        body: JSON.stringify({ t: "pageview", p: "/", sid }),
+      }),
+      env,
+    );
+  }
+
+  it("rejects an origin not in the tenant's allowlist", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints, { domains: ["example.com"] });
+    const res = await collect(env, "https://evil.com", "reject_tenant");
+    expect(res.status).toBe(400);
+    expect(dataPoints).toHaveLength(0);
+  });
+
+  it("rejects a site with no registered domains by default", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints, { domains: null });
+    const res = await collect(env, "https://example.com", "noreg_tenant");
+    expect(res.status).toBe(400);
+    expect(dataPoints).toHaveLength(0);
+  });
+
+  it("allows an unregistered site only when ALLOW_UNREGISTERED_DOMAINS=true", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints, {
+      domains: null,
+      allowUnregistered: "true",
+    });
+    const res = await collect(env, "https://example.com", "grace_tenant");
+    expect(res.status).toBe(204);
+    expect(dataPoints).toHaveLength(1);
+  });
+});
+
 const browserUa =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-function createMockEnv(dataPoints: AnalyticsEngineDataPoint[]): Env {
+interface MockEnvOptions {
+  /** Allowlist returned by the mock KV. `null` = no KV entry (unregistered). */
+  domains?: string[] | null;
+  allowUnregistered?: string;
+}
+
+function createMockEnv(
+  dataPoints: AnalyticsEngineDataPoint[],
+  opts: MockEnvOptions = {},
+): Env {
+  const domainsValue = opts.domains === undefined ? ["example.com"] : opts.domains;
   const domainsKv = {
-    get: async () => JSON.stringify(["example.com"]),
+    get: async () =>
+      domainsValue === null ? null : JSON.stringify(domainsValue),
   } as KVNamespace;
 
   return {
@@ -399,6 +539,6 @@ function createMockEnv(dataPoints: AnalyticsEngineDataPoint[]): Env {
     INGEST_TOKEN: "ingest-secret",
     ACCOUNT_ID: "account",
     ENVIRONMENT: "production",
-    ALLOW_UNREGISTERED_DOMAINS: "false",
+    ALLOW_UNREGISTERED_DOMAINS: opts.allowUnregistered ?? "false",
   };
 }

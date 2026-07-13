@@ -11,7 +11,9 @@ const WORKER_URL =
 
 const AUTH_TOKEN = requireEnv("ANALYTICS_AUTH_TOKEN");
 
-const TENANT_ID = "fkeop5c7d4q7gzemgbjhwjlc";
+// Keep in sync with scripts/seed.ts (same default) so seeding and querying
+// target the same tenant. Override both with ANALYTICS_TENANT_ID.
+const TENANT_ID = process.env.ANALYTICS_TENANT_ID ?? "pddzczoc8i3c22liiyjwnwzl";
 
 const ROUTES = [
     "/api/overview",

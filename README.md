@@ -122,7 +122,8 @@ The tracker automatically:
 
 - Sends a `pageview` event on initial load
 - Sends a `beacon` event with time-on-page on `visibilitychange` and `pagehide`
-- Tracks SPA navigation via `pushState`, `replaceState`, `popstate`, and `hashchange`
+- Tracks SPA navigation via the History API (`pushState`, `replaceState`, `popstate`)
+- Re-emits a pageview when the page is restored from the back-forward cache
 - Extracts UTM parameters from the page URL
 - Supports custom events via `window.manhali.track("event_name")`
 - Supports manual pageview dispatch via `window.manhali.pageview()`
@@ -146,7 +147,7 @@ Query routes require `Authorization: Bearer <token>` and `?tenant_id=`.
 
 | Method | Path             | Query Params                        | Description                             |
 | ------ | ---------------- | ----------------------------------- | --------------------------------------- |
-| `GET`  | `/api/overview`  | `days` (1-90, default 30)           | Totals plus top pages summary           |
+| `GET`  | `/api/overview`  | `days` (1-90, default 30)           | Totals, avg time-on-page, top pages     |
 | `GET`  | `/api/pages`     | `days`, `limit` (1-100, default 20) | Top pages by views                      |
 | `GET`  | `/api/referrers` | `days`, `limit`                     | Top referrer domains plus UTM data      |
 | `GET`  | `/api/geo`       | `days`                              | Country and city breakdown              |
@@ -191,6 +192,8 @@ Tenant resolution priority on collect:
 3. Development fallback to the request origin hostname when `ENVIRONMENT=development`
 
 `wrangler.toml` defaults to `ENVIRONMENT=production` so deployments enforce the KV domain allowlist unless you explicitly override it for local development.
+
+> **Trust model for browser collection.** Like every client-side beacon endpoint (GA, Plausible, Fathom), `/api/collect` is unauthenticated and the `Origin`/`Referer` allowlist is only a best-effort filter — a non-browser client can spoof those headers, and the `sid` is public (it ships in `/tracker.js`). Treat browser-submitted analytics as best-effort, not tamper-proof; use the server-to-server `tid` + Bearer path for trusted data. Configure a **Cloudflare Rate Limiting rule** on `/api/collect` in production to bound abuse/cost, and never leave `ALLOW_UNREGISTERED_DOMAINS="true"` enabled outside a short onboarding window (it disables origin checks entirely).
 
 ## Cloudflare Bindings
 

@@ -11,8 +11,14 @@ pattern = "analytics.worker.manhali.com"
 zone_name = "manhali.com"
 custom_domain = true
 
-[triggers]
-crons = ["0 0 * * *"]
+# No [triggers]/crons: Analytics Engine has built-in 90-day retention, so there
+# is no scheduled rollup/cleanup work. The worker exports only fetch(); a cron
+# trigger with no scheduled() handler would fire daily with nothing to run.
+#
+# The unauthenticated POST /api/collect endpoint is intentionally not
+# rate-limited in-worker (see ANALYTICS_ARCHITECTURE.md). Configure abuse
+# protection at the edge — a Cloudflare Rate Limiting rule scoped to
+# /api/collect — for production traffic.
 
 [observability]
 enabled = true

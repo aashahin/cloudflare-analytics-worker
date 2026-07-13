@@ -13,7 +13,9 @@ const WORKER_URL =
 
 const AUTH_TOKEN = requireEnv("ANALYTICS_AUTH_TOKEN");
 
-const TENANT_ID = "pddzczoc8i3c22liiyjwnwzl";
+// Keep in sync with scripts/test-queries.ts (same default) so seeding and
+// querying target the same tenant. Override both with ANALYTICS_TENANT_ID.
+const TENANT_ID = process.env.ANALYTICS_TENANT_ID ?? "pddzczoc8i3c22liiyjwnwzl";
 
 // ─── Seed Data Pools ─────────────────────────────────────────────────────────
 

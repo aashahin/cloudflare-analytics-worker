@@ -66,8 +66,13 @@ async function queryAnalyticsEngine(
 // ─── Pre-built Queries ───────────────────────────────────────────────────────
 
 /**
- * Dashboard overview: total views, unique visitors, top pages.
+ * Dashboard overview: total views, unique visitors, avg time-on-page, top pages.
  * Uses SUM(_sample_interval) to account for sampling.
+ *
+ * Note on sampling: view/event totals are reconstructed with
+ * SUM(_sample_interval), but COUNT(DISTINCT blob3) (uniqueVisitors) cannot be
+ * sample-weighted, so under heavy sampling it is a lower-bound estimate and
+ * should not be compared 1:1 against the scaled totals.
  */
 export async function getOverview(
   env: Env,
@@ -101,16 +106,30 @@ export async function getOverview(
     LIMIT 10
   `;
 
-  const [overviewResult, pagesResult] = await Promise.all([
+  // Average time-on-page comes from beacon events (double2 = seconds on page),
+  // which the tracker emits on tab-hide / pagehide. Without this the beacon
+  // writes would have no read path at all.
+  const timeSql = `
+    SELECT AVG(double2) AS avg_time_on_page
+    FROM manhali_analytics
+    WHERE blob1 = '${escapeSql(tenantId)}'
+      AND blob11 = 'beacon'
+      AND timestamp >= NOW() - INTERVAL '${days}' DAY
+  `;
+
+  const [overviewResult, pagesResult, timeResult] = await Promise.all([
     queryAnalyticsEngine(env, sql),
     queryAnalyticsEngine(env, topPagesSql),
+    queryAnalyticsEngine(env, timeSql),
   ]);
 
   const overview = overviewResult.data[0];
+  const avgTime = Number(timeResult.data[0]?.avg_time_on_page ?? 0);
 
   return {
     totalViews: Number(overview?.total_views ?? 0),
     uniqueVisitors: Number(overview?.unique_visitors ?? 0),
+    avgTimeOnPage: Number.isFinite(avgTime) ? Math.round(avgTime) : 0,
     topPages: pagesResult.data.map((row) => ({
       pagePath: String(row.page_path),
       views: Number(row.views),

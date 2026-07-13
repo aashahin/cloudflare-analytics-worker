@@ -62,11 +62,16 @@ export async function trackEvent(
 
   const ip = request.headers.get("CF-Connecting-IP") ?? "0.0.0.0";
 
-  // Privacy-safe visitor hash for unique visitor aggregation
-  // Uses a dedicated secret (separate from AUTH_TOKEN for defense in depth)
+  // Privacy-safe visitor hash for unique visitor aggregation.
+  // Uses a dedicated secret (separate from AUTH_TOKEN for defense in depth),
+  // scoped to the tenant and bucketed by UTC day so identities cannot be
+  // correlated across tenants and rotate daily (see fingerprint.ts).
+  const dayBucket = new Date().toISOString().slice(0, 10); // UTC "YYYY-MM-DD"
   const visitorHash = await generateVisitorHash(
+    tenantId,
     ip,
     userAgent,
+    dayBucket,
     env.FINGERPRINT_SECRET,
   );
 
@@ -83,7 +88,11 @@ export async function trackEvent(
   // which is the actual external referrer. The request's Referer header points to
   // the page making the beacon call, which is the tenant's own page — not useful.
   const originHost = extractHostname(request.headers.get("Origin")) ?? "";
-  const referrer = rawReferrer ? cleanReferrer(rawReferrer, originHost) : "";
+  // cleanReferrer already reduces to a hostname; cap length as defense-in-depth
+  // so no single blob can grow toward the 16 KB per-data-point blob budget.
+  const referrer = rawReferrer
+    ? cleanReferrer(rawReferrer, originHost).slice(0, 253)
+    : "";
 
   // UTM: prefer values from collect body (tracker extracts from the page URL).
   // The worker's own URL (/api/collect) never has UTM params.

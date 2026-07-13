@@ -27,6 +27,8 @@ export type DeviceType = (typeof DEVICE_TYPES)[keyof typeof DEVICE_TYPES];
 export interface OverviewStats {
   totalViews: number;
   uniqueVisitors: number;
+  /** Average time-on-page in seconds, derived from beacon (double2) events. */
+  avgTimeOnPage: number;
   topPages: PageStat[];
 }
 

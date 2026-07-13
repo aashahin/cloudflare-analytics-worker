@@ -100,7 +100,7 @@ Scoped tenant tokens are allowed on query routes and rejected on admin routes.
 | -------- | -------------- | --------------------------------------------------------------------- |
 | `blob1`  | `tenant_id`    | Tenant identifier and AE index                                        |
 | `blob2`  | `page_path`    | Sanitized URL path                                                    |
-| `blob3`  | `visitor_hash` | Daily-rotating privacy-safe visitor hash                              |
+| `blob3`  | `visitor_hash` | Tenant-scoped, daily-rotating privacy-safe visitor hash               |
 | `blob4`  | `country`      | Cloudflare country, optionally overridden for server-to-server ingest |
 | `blob5`  | `city`         | Cloudflare city, optionally overridden for server-to-server ingest    |
 | `blob6`  | `device_type`  | `Desktop`, `Mobile`, or `Tablet`                                      |
@@ -158,7 +158,13 @@ If a production site has no registered domains:
 - default behavior: reject browser collect requests
 - optional grace period: allow requests only when `ALLOW_UNREGISTERED_DOMAINS="true"`
 
-Admin mutations invalidate the in-memory cache for that tenant.
+Admin mutations call `invalidateDomainCache`, but that only clears the cache on
+the single isolate that served the admin request. Other warm isolates across the
+edge keep their cached allowlist until their own five-minute TTL expires, so
+domain adds and removals are **eventually consistent within ~5 minutes**, not
+globally immediate. This matters most on removal: a de-authorized origin can keep
+being accepted on other warm isolates for up to the TTL window. Lower
+`DOMAIN_CACHE_TTL_MS` if a shorter propagation window is required.
 
 ---
 
@@ -206,7 +212,7 @@ For every accepted collect request the worker performs:
 - page paths sanitized
 
 5. Bot filtering using the request User-Agent
-6. Visitor hash generation using IP + UA + current day + `FINGERPRINT_SECRET`
+6. Visitor hash generation using tenant ID + IP + UA + current UTC day + `FINGERPRINT_SECRET` (tenant-scoped so the same visitor cannot be correlated across tenants; rotates daily)
 7. Geo, device, referrer, and UTM extraction
 8. `env.ANALYTICS.writeDataPoint()` fire-and-forget write
 
@@ -273,7 +279,7 @@ The generated tracker script is intentionally small and framework-agnostic.
 | ---------- | --------------------------------- | ----------------------------------------------------------- |
 | `pageview` | initial load                      | Includes `document.referrer` and UTM params                 |
 | `beacon`   | `visibilitychange` and `pagehide` | Sends time-on-page in seconds                               |
-| `pageview` | SPA navigation                    | Hooks `pushState`, `replaceState`, `popstate`, `hashchange` |
+| `pageview` | SPA navigation                    | Hooks `pushState`, `replaceState`, and `popstate` (History API) |
 | `event`    | `window.manhali.track(name)`      | Sends custom event names                                    |
 
 ### Exposed browser API
