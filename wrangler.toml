@@ -51,3 +51,30 @@ ALLOW_UNREGISTERED_DOMAINS = "false"
 # ─── Dev settings ─────────────────────────────────────────────────────────────
 [dev]
 port = 8790
+
+# ─── Sandbox account (a793ff57a25dfe6874a8738f9addd295) ───────────────────────
+# Deploy: wrangler deploy --env sandbox  (OAuth multi-account; no prod CF token)
+[env.sandbox]
+name = "manhali-analytics-sandbox"
+account_id = "a793ff57a25dfe6874a8738f9addd295"
+workers_dev = true
+preview_urls = true
+# No manhali.com custom domain on the sandbox account (routes not inherited when empty).
+routes = []
+
+[[env.sandbox.analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "manhali_analytics_sandbox"
+
+[[env.sandbox.kv_namespaces]]
+binding = "DOMAINS_KV"
+id = "4297ecdc81f6418ca37d2a05a94f5bf1"
+
+[env.sandbox.vars]
+ENVIRONMENT = "staging"
+ACCOUNT_ID = "a793ff57a25dfe6874a8738f9addd295"
+ALLOW_UNREGISTERED_DOMAINS = "true"
+
+[env.sandbox.observability]
+enabled = true
+head_sampling_rate = 1
