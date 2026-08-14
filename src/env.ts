@@ -19,6 +19,8 @@ export interface Env {
   // Vars
   ACCOUNT_ID: string;
   ENVIRONMENT: string;
+  /** Analytics Engine SQL table/dataset. Production: manhali_analytics. */
+  ANALYTICS_DATASET?: string;
 
   // Allow collect from sites with no registered domains (set to "true" for setup grace period)
   ALLOW_UNREGISTERED_DOMAINS?: string;
