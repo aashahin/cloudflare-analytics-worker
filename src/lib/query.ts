@@ -15,6 +15,19 @@ import type {
 } from "@/lib/schema.ts";
 import { SAFE_TENANT_ID } from "@/lib/utils.ts";
 
+const DEFAULT_ANALYTICS_DATASET = "manhali_analytics";
+const SAFE_ANALYTICS_DATASET = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** Resolve the AE SQL table name. Production default is manhali_analytics. */
+export function resolveAnalyticsDataset(env: Env): string {
+  const raw = env.ANALYTICS_DATASET?.trim();
+  if (!raw) return DEFAULT_ANALYTICS_DATASET;
+  if (!SAFE_ANALYTICS_DATASET.test(raw)) {
+    throw new Error(`Invalid ANALYTICS_DATASET: "${raw}"`);
+  }
+  return raw;
+}
+
 // ─── Input Validation ────────────────────────────────────────────────────────
 
 /** Clamp a numeric value to safe bounds. Returns defaultVal if input is invalid. */
@@ -81,12 +94,13 @@ export async function getOverview(
 ): Promise<OverviewStats> {
   validateTenantId(tenantId);
   days = clampInt(days, 30, 1, 90);
+  const dataset = resolveAnalyticsDataset(env);
 
   const sql = `
     SELECT
       SUM(_sample_interval) AS total_views,
       COUNT(DISTINCT blob3) AS unique_visitors
-    FROM manhali_analytics
+    FROM ${dataset}
     WHERE blob1 = '${escapeSql(tenantId)}'
       AND blob11 = 'pageview'
       AND timestamp >= NOW() - INTERVAL '${days}' DAY
@@ -97,7 +111,7 @@ export async function getOverview(
       blob2 AS page_path,
       SUM(_sample_interval) AS views,
       COUNT(DISTINCT blob3) AS unique_visitors
-    FROM manhali_analytics
+    FROM ${dataset}
     WHERE blob1 = '${escapeSql(tenantId)}'
       AND blob11 = 'pageview'
       AND timestamp >= NOW() - INTERVAL '${days}' DAY
@@ -111,7 +125,7 @@ export async function getOverview(
   // writes would have no read path at all.
   const timeSql = `
     SELECT AVG(double2) AS avg_time_on_page
-    FROM manhali_analytics
+    FROM ${dataset}
     WHERE blob1 = '${escapeSql(tenantId)}'
       AND blob11 = 'beacon'
       AND timestamp >= NOW() - INTERVAL '${days}' DAY
@@ -150,13 +164,14 @@ export async function getTopPages(
   validateTenantId(tenantId);
   days = clampInt(days, 30, 1, 90);
   limit = clampInt(limit, 20, 1, 100);
+  const dataset = resolveAnalyticsDataset(env);
 
   const sql = `
     SELECT
       blob2 AS page_path,
       SUM(_sample_interval) AS views,
       COUNT(DISTINCT blob3) AS unique_visitors
-    FROM manhali_analytics
+    FROM ${dataset}
     WHERE blob1 = '${escapeSql(tenantId)}'
       AND blob11 = 'pageview'
       AND timestamp >= NOW() - INTERVAL '${days}' DAY
@@ -186,6 +201,7 @@ export async function getTopReferrers(
   validateTenantId(tenantId);
   days = clampInt(days, 30, 1, 90);
   limit = clampInt(limit, 20, 1, 100);
+  const dataset = resolveAnalyticsDataset(env);
 
   const sql = `
     SELECT
@@ -194,7 +210,7 @@ export async function getTopReferrers(
       blob9 AS utm_medium,
       blob10 AS utm_campaign,
       SUM(_sample_interval) AS views
-    FROM manhali_analytics
+    FROM ${dataset}
     WHERE blob1 = '${escapeSql(tenantId)}'
       AND blob11 = 'pageview'
       AND timestamp >= NOW() - INTERVAL '${days}' DAY
@@ -225,6 +241,7 @@ export async function getGeoBreakdown(
 ): Promise<GeoStat[]> {
   validateTenantId(tenantId);
   days = clampInt(days, 30, 1, 90);
+  const dataset = resolveAnalyticsDataset(env);
 
   const sql = `
     SELECT
@@ -232,7 +249,7 @@ export async function getGeoBreakdown(
       blob5 AS city,
       SUM(_sample_interval) AS views,
       COUNT(DISTINCT blob3) AS unique_visitors
-    FROM manhali_analytics
+    FROM ${dataset}
     WHERE blob1 = '${escapeSql(tenantId)}'
       AND blob11 = 'pageview'
       AND timestamp >= NOW() - INTERVAL '${days}' DAY
@@ -261,13 +278,14 @@ export async function getDeviceBreakdown(
 ): Promise<DeviceStat[]> {
   validateTenantId(tenantId);
   days = clampInt(days, 30, 1, 90);
+  const dataset = resolveAnalyticsDataset(env);
 
   const sql = `
     SELECT
       blob6 AS device_type,
       SUM(_sample_interval) AS views,
       COUNT(DISTINCT blob3) AS unique_visitors
-    FROM manhali_analytics
+    FROM ${dataset}
     WHERE blob1 = '${escapeSql(tenantId)}'
       AND blob11 = 'pageview'
       AND timestamp >= NOW() - INTERVAL '${days}' DAY
@@ -292,9 +310,10 @@ export async function getRealtime(
   tenantId: string,
 ): Promise<RealtimeStat> {
   validateTenantId(tenantId);
+  const dataset = resolveAnalyticsDataset(env);
   const totalSql = `
     SELECT COUNT(DISTINCT blob3) AS current_visitors
-    FROM manhali_analytics
+    FROM ${dataset}
     WHERE blob1 = '${escapeSql(tenantId)}'
       AND blob11 = 'pageview'
       AND timestamp >= NOW() - INTERVAL '30' MINUTE
@@ -304,7 +323,7 @@ export async function getRealtime(
     SELECT
       blob2 AS page_path,
       COUNT(DISTINCT blob3) AS visitors
-    FROM manhali_analytics
+    FROM ${dataset}
     WHERE blob1 = '${escapeSql(tenantId)}'
       AND blob11 = 'pageview'
       AND timestamp >= NOW() - INTERVAL '30' MINUTE
@@ -338,13 +357,14 @@ export async function getCustomEvents(
   validateTenantId(tenantId);
   days = clampInt(days, 30, 1, 90);
   limit = clampInt(limit, 20, 1, 100);
+  const dataset = resolveAnalyticsDataset(env);
 
   const sql = `
     SELECT
       blob12 AS event_name,
       SUM(_sample_interval) AS total_events,
       COUNT(DISTINCT blob3) AS unique_visitors
-    FROM manhali_analytics
+    FROM ${dataset}
     WHERE blob1 = '${escapeSql(tenantId)}'
       AND blob11 = 'event'
       AND timestamp >= NOW() - INTERVAL '${days}' DAY

@@ -47,6 +47,7 @@ id = "e2809ede5e784984b34d6c85a16465bd"
 ENVIRONMENT = "production"
 ACCOUNT_ID = "53fb41ede04e54b276ce3fd9bfd270b6"
 ALLOW_UNREGISTERED_DOMAINS = "false"
+ANALYTICS_DATASET = "manhali_analytics"
 
 # ─── Dev settings ─────────────────────────────────────────────────────────────
 [dev]
@@ -74,6 +75,7 @@ id = "4297ecdc81f6418ca37d2a05a94f5bf1"
 ENVIRONMENT = "staging"
 ACCOUNT_ID = "a793ff57a25dfe6874a8738f9addd295"
 ALLOW_UNREGISTERED_DOMAINS = "true"
+ANALYTICS_DATASET = "manhali_analytics_sandbox"
 
 [env.sandbox.observability]
 enabled = true
