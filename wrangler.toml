@@ -3,6 +3,8 @@
 name = "manhali-analytics"
 main = "src/index.ts"
 account_id = "53fb41ede04e54b276ce3fd9bfd270b6"
+workers_dev = false
+preview_urls = false
 compatibility_date = "2026-05-29"
 compatibility_flags = ["nodejs_compat"]
 

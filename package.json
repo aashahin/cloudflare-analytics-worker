@@ -8,8 +8,11 @@
   },
   "private": true,
   "scripts": {
+    "build:cf:production": "wrangler deploy --dry-run --config wrangler.toml --env=\"\"",
+    "build:cf:sandbox": "wrangler deploy --dry-run --config wrangler.toml --env sandbox",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy:production": "wrangler deploy --config wrangler.toml --env=\"\"",
+    "deploy:sandbox": "wrangler deploy --config wrangler.toml --env sandbox",
     "tail": "wrangler tail",
     "test": "bun test"
   },
