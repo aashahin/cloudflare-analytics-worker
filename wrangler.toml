@@ -8,6 +8,16 @@ preview_urls = false
 compatibility_date = "2026-05-29"
 compatibility_flags = ["nodejs_compat"]
 
+[[rules]]
+type = "ESModule"
+globs = ["**/*.js"]
+fallthrough = true
+
+[[rules]]
+type = "CompiledWasm"
+globs = ["**/*.wasm"]
+fallthrough = true
+
 [[routes]]
 pattern = "analytics.worker.manhali.com"
 zone_name = "manhali.com"
