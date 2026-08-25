@@ -20,6 +20,7 @@ import {
 import { trackEvent } from "@/lib/ingest.ts";
 import {
   getCustomEvents,
+  getDashboardSections,
   getDeviceBreakdown,
   getGeoBreakdown,
   getOverview,
@@ -148,6 +149,12 @@ export default {
           return privateJsonResponse(
             request,
             await getCustomEvents(env, tenantId!, days, limit),
+          );
+
+        case "/api/sections":
+          return privateJsonResponse(
+            request,
+            await getDashboardSections(env, tenantId!, days, limit),
           );
 
         default:

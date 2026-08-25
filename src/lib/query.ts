@@ -382,6 +382,95 @@ export async function getCustomEvents(
   }));
 }
 
+export type DashboardSectionErrors = {
+  pages: boolean;
+  referrers: boolean;
+  geo: boolean;
+  devices: boolean;
+  events: boolean;
+};
+
+export type DashboardSections = {
+  pages: PageStat[];
+  referrers: ReferrerStat[];
+  geo: GeoStat[];
+  devices: DeviceStat[];
+  events: EventStat[];
+  errors: DashboardSectionErrors;
+};
+
+const SECTIONS_CACHE_TTL_MS = 30_000;
+const SECTIONS_CACHE_MAX = 50;
+const sectionsCache = new Map<
+  string,
+  { expiresAt: number; value: DashboardSections }
+>();
+
+function sectionsCacheKey(
+  tenantId: string,
+  days: number,
+  limit: number,
+): string {
+  return `${tenantId}:${days}:${limit}`;
+}
+
+export function clearDashboardSectionsCache(): void {
+  sectionsCache.clear();
+}
+
+/**
+ * One dashboard round-trip instead of five public HTTP calls from the
+ * platform Worker. Cached per isolate for 30s so tab reloads and fetcher
+ * retries do not re-bill Analytics Engine SQL.
+ */
+export async function getDashboardSections(
+  env: Env,
+  tenantId: string,
+  days: number = 30,
+  limit: number = 20,
+): Promise<DashboardSections> {
+  const key = sectionsCacheKey(tenantId, days, limit);
+  const hit = sectionsCache.get(key);
+  if (hit && hit.expiresAt > Date.now()) {
+    return hit.value;
+  }
+
+  const [pages, referrers, geo, devices, events] = await Promise.allSettled([
+    getTopPages(env, tenantId, days, limit),
+    getTopReferrers(env, tenantId, days, limit),
+    getGeoBreakdown(env, tenantId, days),
+    getDeviceBreakdown(env, tenantId, days),
+    getCustomEvents(env, tenantId, days, limit),
+  ]);
+  const value: DashboardSections = {
+    pages: pages.status === "fulfilled" ? pages.value : [],
+    referrers: referrers.status === "fulfilled" ? referrers.value : [],
+    geo: geo.status === "fulfilled" ? geo.value : [],
+    devices: devices.status === "fulfilled" ? devices.value : [],
+    events: events.status === "fulfilled" ? events.value : [],
+    errors: {
+      pages: pages.status === "rejected",
+      referrers: referrers.status === "rejected",
+      geo: geo.status === "rejected",
+      devices: devices.status === "rejected",
+      events: events.status === "rejected",
+    },
+  };
+
+  const hasError = Object.values(value.errors).some(Boolean);
+  if (!hasError) {
+    if (sectionsCache.size >= SECTIONS_CACHE_MAX) {
+      const first = sectionsCache.keys().next().value;
+      if (first) sectionsCache.delete(first);
+    }
+    sectionsCache.set(key, {
+      expiresAt: Date.now() + SECTIONS_CACHE_TTL_MS,
+      value,
+    });
+  }
+  return value;
+}
+
 // ─── SQL Escape ──────────────────────────────────────────────────────────────
 
 /** Escape a string for use in AE SQL. Strips control characters and escapes quotes + backslashes. */

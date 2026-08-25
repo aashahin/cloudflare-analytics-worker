@@ -10,7 +10,12 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Env } from "../src/env.ts";
-import { getRealtime, getTopPages } from "../src/lib/query.ts";
+import {
+  clearDashboardSectionsCache,
+  getDashboardSections,
+  getRealtime,
+  getTopPages,
+} from "../src/lib/query.ts";
 
 const PRODUCTION_DATASET = "manhali_analytics";
 const SANDBOX_DATASET = "manhali_analytics_sandbox";
@@ -139,5 +144,31 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
     const source = readFileSync(querySourcePath, "utf8");
     expect(source).not.toMatch(/FROM\s+manhali_analytics\s*$/m);
     expect(source).toMatch(/ANALYTICS_DATASET/);
+  });
+
+  it("dashboard sections fan-out is one cacheable round trip per tenant window", async () => {
+    clearDashboardSectionsCache();
+    const env = createQueryEnv(SANDBOX_DATASET);
+    const captured = captureSql(env);
+
+    const first = await getDashboardSections(env, "tenant_sections", 7, 10);
+    expect(captured.sql).toHaveLength(5);
+    expect(first.errors).toEqual({
+      pages: false,
+      referrers: false,
+      geo: false,
+      devices: false,
+      events: false,
+    });
+    for (const sql of captured.sql) {
+      expect(sql).toMatch(fromClause(SANDBOX_DATASET));
+    }
+
+    const second = await getDashboardSections(env, "tenant_sections", 7, 10);
+    expect(captured.sql).toHaveLength(5);
+    expect(second.errors).toEqual(first.errors);
+
+    captured.restore();
+    clearDashboardSectionsCache();
   });
 });
