@@ -224,13 +224,16 @@ The worker returns `204 No Content` for successful collect requests.
 
 `src/lib/query.ts` contains the pre-built Analytics Engine SQL queries for:
 
-- overview totals plus top pages
+- slim overview totals (views, unique visitors, avg time-on-page) in one SQL
 - page rankings
 - referrers and UTM sources
 - geographic breakdown
 - device breakdown
 - realtime visitors
 - custom events
+- batched dashboard sections
+
+Overview, realtime, and sections results are cached 30s (isolate Map L1 + Workers Cache API) so dashboard polls do not re-bill Analytics Engine SQL.
 
 Visitor counts returned as `uniqueVisitors` are unique daily visitors. The underlying visitor hash intentionally rotates every UTC day, so these values should not be interpreted as a cross-day person count.
 
@@ -265,7 +268,7 @@ The query layer validates `tenantId` before embedding it into SQL and escapes si
 - No client-side fingerprinting
 - Visitor identity rotates daily, preventing cross-day tracking
 
-Rate limiting is expected to be configured at Cloudflare's edge rather than inside the worker.
+`POST /api/collect` is rate-limited in-worker via the `COLLECT_RATE_LIMIT` binding (60 requests / 60 seconds per `CF-Connecting-IP`). Authenticated server-to-server ingest skips the limiter. Exceeded limits return `429` with public CORS.
 
 ---
 

@@ -121,7 +121,7 @@ export async function resolveTenant(
   isServerToServer: boolean;
 }> {
   // Server-to-server with Bearer auth — trust body.tid (uses INGEST_TOKEN if set)
-  if (body.tid && verifyIngestAuth(request, env)) {
+  if (body.tid && (await verifyIngestAuth(request, env))) {
     if (!SAFE_TENANT_ID.test(body.tid)) {
       return {
         tenantId: null,

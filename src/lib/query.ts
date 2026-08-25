@@ -1,6 +1,10 @@
 // ─── Analytics Engine Query Helper ───────────────────────────────────────────
 // Queries the Cloudflare Analytics Engine SQL API from within the Worker.
 // All queries are scoped to a single tenant via blob1 = tenant_id.
+//
+// AE SQL is billed per query ($1 / million). Overview / realtime / sections
+// go through a colo Cache API (30s) plus an isolate Map L1 so dashboard polls
+// do not re-bill. Pattern matches apps/backend/src/worker/audit/analytics-sql.ts.
 
 import type { Env } from "@/env.ts";
 import type {
@@ -50,9 +54,122 @@ function validateTenantId(tenantId: string): void {
   }
 }
 
+// ─── Cache (isolate L1 + Workers Cache API) ──────────────────────────────────
+
+const QUERY_CACHE_TTL_SECONDS = 30;
+const QUERY_CACHE_TTL_MS = QUERY_CACHE_TTL_SECONDS * 1000;
+const QUERY_CACHE_L1_MAX = 50;
+const CACHE_NAMESPACE = "analytics-query-v1";
+const CACHE_ORIGIN = "https://analytics-query.manhali.internal/v1/";
+
+const queryL1 = new Map<string, { expiresAt: number; value: unknown }>();
+let cacheHandle: Promise<Cache> | undefined;
+
+function queryCacheHandle(): Promise<Cache> | undefined {
+  try {
+    if (typeof caches === "undefined" || typeof caches.open !== "function") {
+      return undefined;
+    }
+    cacheHandle ??= caches.open(CACHE_NAMESPACE);
+    return cacheHandle;
+  } catch {
+    return undefined;
+  }
+}
+
+async function hashCacheKey(material: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(material),
+  );
+  const bytes = new Uint8Array(digest);
+  let hex = "";
+  for (const byte of bytes) hex += byte.toString(16).padStart(2, "0");
+  return hex;
+}
+
+function rememberL1<T>(key: string, value: T): void {
+  if (queryL1.size >= QUERY_CACHE_L1_MAX) {
+    const first = queryL1.keys().next().value;
+    if (first) queryL1.delete(first);
+  }
+  queryL1.set(key, { expiresAt: Date.now() + QUERY_CACHE_TTL_MS, value });
+}
+
+async function cacheApiGet<T>(key: string): Promise<T | undefined> {
+  try {
+    const handle = queryCacheHandle();
+    if (!handle) return undefined;
+    const cache = await handle;
+    const hit = await cache.match(new Request(CACHE_ORIGIN + key));
+    if (hit === undefined) return undefined;
+    return (await hit.json()) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+async function cacheApiPut(key: string, value: unknown): Promise<void> {
+  try {
+    const handle = queryCacheHandle();
+    if (!handle) return;
+    const cache = await handle;
+    await cache.put(
+      new Request(CACHE_ORIGIN + key),
+      new Response(JSON.stringify(value), {
+        headers: {
+          "content-type": "application/json",
+          "cache-control": `max-age=${QUERY_CACHE_TTL_SECONDS}`,
+        },
+      }),
+    );
+  } catch {
+    // A cache that cannot store is a cache miss next time.
+  }
+}
+
+/**
+ * L1 isolate Map, then colo Cache API, then `load`. Failures in Cache API
+ * degrade to "slower and billed", never to 500.
+ */
+async function withCachedResult<T>(
+  material: string,
+  load: () => Promise<T>,
+  shouldStore: (value: T) => boolean = () => true,
+): Promise<T> {
+  const key = await hashCacheKey(material);
+  const hit = queryL1.get(key);
+  if (hit && hit.expiresAt > Date.now()) {
+    return hit.value as T;
+  }
+
+  const cached = await cacheApiGet<T>(key);
+  if (cached !== undefined) {
+    rememberL1(key, cached);
+    return cached;
+  }
+
+  const value = await load();
+  if (shouldStore(value)) {
+    rememberL1(key, value);
+    await cacheApiPut(key, value);
+  }
+  return value;
+}
+
+/** Drop isolate L1 (Cache API entries expire via max-age). */
+export function clearAnalyticsQueryCache(): void {
+  queryL1.clear();
+  cacheHandle = undefined;
+}
+
+export function clearDashboardSectionsCache(): void {
+  clearAnalyticsQueryCache();
+}
+
 // ─── SQL API Client ──────────────────────────────────────────────────────────
 
-async function queryAnalyticsEngine(
+async function fetchAnalyticsEngine(
   env: Env,
   sql: string,
 ): Promise<AnalyticsEngineResponse> {
@@ -76,11 +193,18 @@ async function queryAnalyticsEngine(
   return response.json() as Promise<AnalyticsEngineResponse>;
 }
 
+async function queryAnalyticsEngine(
+  env: Env,
+  sql: string,
+): Promise<AnalyticsEngineResponse> {
+  return withCachedResult(`sql:${sql}`, () => fetchAnalyticsEngine(env, sql));
+}
+
 // ─── Pre-built Queries ───────────────────────────────────────────────────────
 
 /**
- * Dashboard overview: total views, unique visitors, avg time-on-page, top pages.
- * Uses SUM(_sample_interval) to account for sampling.
+ * Slim dashboard overview: total views, unique visitors, avg time-on-page.
+ * One AE SQL. Top pages live on /api/pages and /api/sections.
  *
  * Note on sampling: view/event totals are reconstructed with
  * SUM(_sample_interval), but COUNT(DISTINCT blob3) (uniqueVisitors) cannot be
@@ -96,60 +220,34 @@ export async function getOverview(
   days = clampInt(days, 30, 1, 90);
   const dataset = resolveAnalyticsDataset(env);
 
-  const sql = `
+  return withCachedResult(
+    `overview:${dataset}:${tenantId}:${days}`,
+    async () => {
+      // ClickHouse-style AE SQL: one scan for pageview totals + beacon duration.
+      // `if()` is documented; AVG skips NULL so beacon-only duration is isolated.
+      const sql = `
     SELECT
-      SUM(_sample_interval) AS total_views,
-      COUNT(DISTINCT blob3) AS unique_visitors
+      SUM(if(blob11 = 'pageview', _sample_interval, 0)) AS total_views,
+      COUNT(DISTINCT if(blob11 = 'pageview', blob3, NULL)) AS unique_visitors,
+      AVG(if(blob11 = 'beacon', double2, NULL)) AS avg_time_on_page
     FROM ${dataset}
     WHERE blob1 = '${escapeSql(tenantId)}'
-      AND blob11 = 'pageview'
+      AND (blob11 = 'pageview' OR blob11 = 'beacon')
       AND timestamp >= NOW() - INTERVAL '${days}' DAY
   `;
 
-  const topPagesSql = `
-    SELECT
-      blob2 AS page_path,
-      SUM(_sample_interval) AS views,
-      COUNT(DISTINCT blob3) AS unique_visitors
-    FROM ${dataset}
-    WHERE blob1 = '${escapeSql(tenantId)}'
-      AND blob11 = 'pageview'
-      AND timestamp >= NOW() - INTERVAL '${days}' DAY
-    GROUP BY page_path
-    ORDER BY views DESC
-    LIMIT 10
-  `;
+      const overviewResult = await queryAnalyticsEngine(env, sql);
+      const overview = overviewResult.data[0];
+      const avgTime = Number(overview?.avg_time_on_page ?? 0);
 
-  // Average time-on-page comes from beacon events (double2 = seconds on page),
-  // which the tracker emits on tab-hide / pagehide. Without this the beacon
-  // writes would have no read path at all.
-  const timeSql = `
-    SELECT AVG(double2) AS avg_time_on_page
-    FROM ${dataset}
-    WHERE blob1 = '${escapeSql(tenantId)}'
-      AND blob11 = 'beacon'
-      AND timestamp >= NOW() - INTERVAL '${days}' DAY
-  `;
-
-  const [overviewResult, pagesResult, timeResult] = await Promise.all([
-    queryAnalyticsEngine(env, sql),
-    queryAnalyticsEngine(env, topPagesSql),
-    queryAnalyticsEngine(env, timeSql),
-  ]);
-
-  const overview = overviewResult.data[0];
-  const avgTime = Number(timeResult.data[0]?.avg_time_on_page ?? 0);
-
-  return {
-    totalViews: Number(overview?.total_views ?? 0),
-    uniqueVisitors: Number(overview?.unique_visitors ?? 0),
-    avgTimeOnPage: Number.isFinite(avgTime) ? Math.round(avgTime) : 0,
-    topPages: pagesResult.data.map((row) => ({
-      pagePath: String(row.page_path),
-      views: Number(row.views),
-      uniqueVisitors: Number(row.unique_visitors),
-    })),
-  };
+      return {
+        totalViews: Number(overview?.total_views ?? 0),
+        uniqueVisitors: Number(overview?.unique_visitors ?? 0),
+        avgTimeOnPage: Number.isFinite(avgTime) ? Math.round(avgTime) : 0,
+        topPages: [],
+      };
+    },
+  );
 }
 
 /**
@@ -311,7 +409,9 @@ export async function getRealtime(
 ): Promise<RealtimeStat> {
   validateTenantId(tenantId);
   const dataset = resolveAnalyticsDataset(env);
-  const totalSql = `
+
+  return withCachedResult(`realtime:${dataset}:${tenantId}`, async () => {
+    const totalSql = `
     SELECT COUNT(DISTINCT blob3) AS current_visitors
     FROM ${dataset}
     WHERE blob1 = '${escapeSql(tenantId)}'
@@ -319,7 +419,7 @@ export async function getRealtime(
       AND timestamp >= NOW() - INTERVAL '30' MINUTE
   `;
 
-  const pagesSql = `
+    const pagesSql = `
     SELECT
       blob2 AS page_path,
       COUNT(DISTINCT blob3) AS visitors
@@ -332,18 +432,19 @@ export async function getRealtime(
     LIMIT 10
   `;
 
-  const [totalResult, pagesResult] = await Promise.all([
-    queryAnalyticsEngine(env, totalSql),
-    queryAnalyticsEngine(env, pagesSql),
-  ]);
+    const [totalResult, pagesResult] = await Promise.all([
+      queryAnalyticsEngine(env, totalSql),
+      queryAnalyticsEngine(env, pagesSql),
+    ]);
 
-  return {
-    currentVisitors: Number(totalResult.data[0]?.current_visitors ?? 0),
-    topPages: pagesResult.data.map((row) => ({
-      pagePath: String(row.page_path),
-      visitors: Number(row.visitors),
-    })),
-  };
+    return {
+      currentVisitors: Number(totalResult.data[0]?.current_visitors ?? 0),
+      topPages: pagesResult.data.map((row) => ({
+        pagePath: String(row.page_path),
+        visitors: Number(row.visitors),
+      })),
+    };
+  });
 }
 /**
  * Custom events breakdown.
@@ -399,29 +500,10 @@ export type DashboardSections = {
   errors: DashboardSectionErrors;
 };
 
-const SECTIONS_CACHE_TTL_MS = 30_000;
-const SECTIONS_CACHE_MAX = 50;
-const sectionsCache = new Map<
-  string,
-  { expiresAt: number; value: DashboardSections }
->();
-
-function sectionsCacheKey(
-  tenantId: string,
-  days: number,
-  limit: number,
-): string {
-  return `${tenantId}:${days}:${limit}`;
-}
-
-export function clearDashboardSectionsCache(): void {
-  sectionsCache.clear();
-}
-
 /**
  * One dashboard round-trip instead of five public HTTP calls from the
- * platform Worker. Cached per isolate for 30s so tab reloads and fetcher
- * retries do not re-bill Analytics Engine SQL.
+ * platform Worker. Cached 30s (isolate L1 + Cache API) so tab reloads and
+ * fetcher retries do not re-bill Analytics Engine SQL.
  */
 export async function getDashboardSections(
   env: Env,
@@ -429,46 +511,39 @@ export async function getDashboardSections(
   days: number = 30,
   limit: number = 20,
 ): Promise<DashboardSections> {
-  const key = sectionsCacheKey(tenantId, days, limit);
-  const hit = sectionsCache.get(key);
-  if (hit && hit.expiresAt > Date.now()) {
-    return hit.value;
-  }
+  days = clampInt(days, 30, 1, 90);
+  limit = clampInt(limit, 20, 1, 100);
+  const dataset = resolveAnalyticsDataset(env);
 
-  const [pages, referrers, geo, devices, events] = await Promise.allSettled([
-    getTopPages(env, tenantId, days, limit),
-    getTopReferrers(env, tenantId, days, limit),
-    getGeoBreakdown(env, tenantId, days),
-    getDeviceBreakdown(env, tenantId, days),
-    getCustomEvents(env, tenantId, days, limit),
-  ]);
-  const value: DashboardSections = {
-    pages: pages.status === "fulfilled" ? pages.value : [],
-    referrers: referrers.status === "fulfilled" ? referrers.value : [],
-    geo: geo.status === "fulfilled" ? geo.value : [],
-    devices: devices.status === "fulfilled" ? devices.value : [],
-    events: events.status === "fulfilled" ? events.value : [],
-    errors: {
-      pages: pages.status === "rejected",
-      referrers: referrers.status === "rejected",
-      geo: geo.status === "rejected",
-      devices: devices.status === "rejected",
-      events: events.status === "rejected",
+  return withCachedResult(
+    `sections:${dataset}:${tenantId}:${days}:${limit}`,
+    async () => {
+      const [pages, referrers, geo, devices, events] = await Promise.allSettled(
+        [
+          getTopPages(env, tenantId, days, limit),
+          getTopReferrers(env, tenantId, days, limit),
+          getGeoBreakdown(env, tenantId, days),
+          getDeviceBreakdown(env, tenantId, days),
+          getCustomEvents(env, tenantId, days, limit),
+        ],
+      );
+      return {
+        pages: pages.status === "fulfilled" ? pages.value : [],
+        referrers: referrers.status === "fulfilled" ? referrers.value : [],
+        geo: geo.status === "fulfilled" ? geo.value : [],
+        devices: devices.status === "fulfilled" ? devices.value : [],
+        events: events.status === "fulfilled" ? events.value : [],
+        errors: {
+          pages: pages.status === "rejected",
+          referrers: referrers.status === "rejected",
+          geo: geo.status === "rejected",
+          devices: devices.status === "rejected",
+          events: events.status === "rejected",
+        },
+      };
     },
-  };
-
-  const hasError = Object.values(value.errors).some(Boolean);
-  if (!hasError) {
-    if (sectionsCache.size >= SECTIONS_CACHE_MAX) {
-      const first = sectionsCache.keys().next().value;
-      if (first) sectionsCache.delete(first);
-    }
-    sectionsCache.set(key, {
-      expiresAt: Date.now() + SECTIONS_CACHE_TTL_MS,
-      value,
-    });
-  }
-  return value;
+    (value) => !Object.values(value.errors).some(Boolean),
+  );
 }
 
 // ─── SQL Escape ──────────────────────────────────────────────────────────────

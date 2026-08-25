@@ -27,14 +27,22 @@ custom_domain = true
 # is no scheduled rollup/cleanup work. The worker exports only fetch(); a cron
 # trigger with no scheduled() handler would fire daily with nothing to run.
 #
-# The unauthenticated POST /api/collect endpoint is intentionally not
-# rate-limited in-worker (see ANALYTICS_ARCHITECTURE.md). Configure abuse
-# protection at the edge — a Cloudflare Rate Limiting rule scoped to
-# /api/collect — for production traffic.
+# POST /api/collect is rate-limited in-worker (60/min per CF-Connecting-IP).
+# Authenticated server-to-server ingest skips the limiter.
+
+[[ratelimits]]
+name = "COLLECT_RATE_LIMIT"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }
 
 [observability]
 enabled = true
-head_sampling_rate = 1
+head_sampling_rate = 0.05
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 0.05
+invocation_logs = false
 
 # ─── Analytics Engine ─────────────────────────────────────────────────────────
 # Dataset is auto-created on first writeDataPoint() call.
@@ -89,6 +97,16 @@ ACCOUNT_ID = "a793ff57a25dfe6874a8738f9addd295"
 ALLOW_UNREGISTERED_DOMAINS = "true"
 ANALYTICS_DATASET = "manhali_analytics_sandbox"
 
+[[env.sandbox.ratelimits]]
+name = "COLLECT_RATE_LIMIT"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }
+
 [env.sandbox.observability]
 enabled = true
 head_sampling_rate = 0.1
+
+[env.sandbox.observability.logs]
+enabled = true
+head_sampling_rate = 0.1
+invocation_logs = false

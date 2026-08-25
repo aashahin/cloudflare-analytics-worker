@@ -8,6 +8,13 @@ export interface Env {
   // KV namespace for domain allowlist
   DOMAINS_KV: KVNamespace;
 
+  /**
+   * Workers Rate Limit binding (`[[ratelimits]]` in wrangler.toml).
+   * POST /api/collect is limited to 60 requests / 60s per CF-Connecting-IP.
+   * Authenticated server-to-server ingest skips this limiter.
+   */
+  COLLECT_RATE_LIMIT: RateLimit;
+
   // Secrets (set via `wrangler secret put`)
   AUTH_TOKEN: string;
   CF_API_TOKEN: string;

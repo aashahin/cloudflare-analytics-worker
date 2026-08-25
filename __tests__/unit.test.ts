@@ -7,6 +7,7 @@ import worker from "../src/index.ts";
 import type { Env } from "../src/env.ts";
 import {
   createScopedToken,
+  timingSafeEqual,
   verifyAuth,
   verifyIngestAuth,
 } from "../src/lib/auth.ts";
@@ -308,7 +309,7 @@ describe("auth guards", () => {
     await expect(verifyAuth(request, env)).resolves.toEqual({
       authenticated: false,
     });
-    expect(verifyIngestAuth(request, env)).toBe(false);
+    await expect(verifyIngestAuth(request, env)).resolves.toBe(false);
   });
 
   it("fails closed when AUTH_TOKEN is empty", async () => {
@@ -320,7 +321,19 @@ describe("auth guards", () => {
     await expect(verifyAuth(request, env)).resolves.toEqual({
       authenticated: false,
     });
-    expect(verifyIngestAuth(request, env)).toBe(false);
+    await expect(verifyIngestAuth(request, env)).resolves.toBe(false);
+  });
+});
+
+describe("timingSafeEqual", () => {
+  it("returns true for identical strings of any length", async () => {
+    expect(await timingSafeEqual("", "")).toBe(true);
+    expect(await timingSafeEqual("admin-secret", "admin-secret")).toBe(true);
+  });
+
+  it("returns false for different values without leaking length", async () => {
+    expect(await timingSafeEqual("short", "much-longer-secret")).toBe(false);
+    expect(await timingSafeEqual("admin-secret", "admin-secreT")).toBe(false);
   });
 });
 
@@ -504,6 +517,63 @@ describe("collect endpoint", () => {
     expect(dataPoints).toHaveLength(1);
     expect(dataPoints[0]?.indexes?.[0]).toBe("tenant_1");
   });
+
+  it("returns 429 with public CORS when the collect rate limit is exceeded", async () => {
+    const limiter = createFakeRateLimiter({ success: false });
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints, { rateLimit: limiter });
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "https://example.com",
+          "User-Agent": browserUa,
+          "CF-Connecting-IP": "203.0.113.50",
+        },
+        body: JSON.stringify({ t: "pageview", p: "/", sid: "tenant_1" }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    await expect(response.json()).resolves.toMatchObject({
+      error: "Too many requests",
+    });
+    expect(limiter.keys).toEqual(["203.0.113.50"]);
+    expect(dataPoints).toHaveLength(0);
+  });
+
+  it("skips the collect rate limit for authenticated server-to-server ingest", async () => {
+    const limiter = createFakeRateLimiter({ success: false });
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints, { rateLimit: limiter });
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer ingest-secret",
+          Origin: "https://example.com",
+          "User-Agent": browserUa,
+          "CF-Connecting-IP": "203.0.113.50",
+        },
+        body: JSON.stringify({
+          t: "pageview",
+          p: "/",
+          tid: "tenant_1",
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(204);
+    expect(limiter.keys).toHaveLength(0);
+    expect(dataPoints).toHaveLength(1);
+  });
 });
 
 describe("tracker script", () => {
@@ -575,6 +645,24 @@ interface MockEnvOptions {
   /** Allowlist returned by the mock KV. `null` = no KV entry (unregistered). */
   domains?: string[] | null;
   allowUnregistered?: string;
+  rateLimit?: FakeRateLimiter;
+}
+
+interface FakeRateLimiter extends RateLimit {
+  keys: string[];
+}
+
+function createFakeRateLimiter(
+  opts: { success?: boolean } = {},
+): FakeRateLimiter {
+  const keys: string[] = [];
+  return {
+    keys,
+    async limit({ key }: RateLimitOptions) {
+      keys.push(key);
+      return { success: opts.success ?? true };
+    },
+  };
 }
 
 function createMockEnv(
@@ -594,6 +682,7 @@ function createMockEnv(
       },
     },
     DOMAINS_KV: domainsKv,
+    COLLECT_RATE_LIMIT: opts.rateLimit ?? createFakeRateLimiter(),
     AUTH_TOKEN: "admin-secret",
     CF_API_TOKEN: "cf-secret",
     FINGERPRINT_SECRET: "fingerprint-secret",

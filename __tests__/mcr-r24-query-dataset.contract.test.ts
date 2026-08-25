@@ -11,8 +11,10 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Env } from "../src/env.ts";
 import {
+  clearAnalyticsQueryCache,
   clearDashboardSectionsCache,
   getDashboardSections,
+  getOverview,
   getRealtime,
   getTopPages,
 } from "../src/lib/query.ts";
@@ -27,9 +29,16 @@ const wranglerPath = join(import.meta.dir, "../wrangler.toml");
 const querySourcePath = join(import.meta.dir, "../src/lib/query.ts");
 
 const originalFetch = globalThis.fetch;
+const originalCaches = (globalThis as { caches?: CacheStorage }).caches;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  if (originalCaches === undefined) {
+    delete (globalThis as { caches?: CacheStorage }).caches;
+  } else {
+    (globalThis as { caches?: CacheStorage }).caches = originalCaches;
+  }
+  clearAnalyticsQueryCache();
 });
 
 function emptyEngineResponse(): Response {
@@ -62,6 +71,11 @@ function createQueryEnv(dataset?: string): Env {
   return {
     ANALYTICS: { writeDataPoint() {} },
     DOMAINS_KV: { get: async () => null } as KVNamespace,
+    COLLECT_RATE_LIMIT: {
+      async limit() {
+        return { success: true };
+      },
+    },
     AUTH_TOKEN: "admin-secret",
     CF_API_TOKEN: "cf-secret",
     FINGERPRINT_SECRET: "fingerprint-secret",
@@ -70,6 +84,44 @@ function createQueryEnv(dataset?: string): Env {
     ALLOW_UNREGISTERED_DOMAINS: "true",
     ...(dataset !== undefined ? { ANALYTICS_DATASET: dataset } : {}),
   };
+}
+
+function installMemoryCaches(): void {
+  const buckets = new Map<string, Map<string, string>>();
+  (globalThis as { caches: CacheStorage }).caches = {
+    open: async (name: string) => {
+      let store = buckets.get(name);
+      if (!store) {
+        store = new Map();
+        buckets.set(name, store);
+      }
+      const entries = store;
+      return {
+        match: async (request: RequestInfo | URL) => {
+          const url = request instanceof Request ? request.url : String(request);
+          const body = entries.get(url);
+          if (body === undefined) return undefined;
+          return new Response(body, {
+            headers: { "content-type": "application/json" },
+          });
+        },
+        put: async (request: RequestInfo | URL, response: Response) => {
+          const url = request instanceof Request ? request.url : String(request);
+          entries.set(url, await response.clone().text());
+        },
+        delete: async () => false,
+        keys: async () => [],
+        add: async () => undefined,
+        addAll: async () => undefined,
+        matchAll: async () => [],
+      } as Cache;
+    },
+    default: undefined as unknown as Cache,
+    delete: async () => false,
+    has: async () => false,
+    keys: async () => [],
+    match: async () => undefined,
+  } as CacheStorage;
 }
 
 function fromClause(dataset: string): RegExp {
@@ -138,6 +190,16 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
     expect(sandbox).toMatch(
       /ANALYTICS_DATASET\s*=\s*"manhali_analytics_sandbox"/,
     );
+
+    expect(production).toMatch(/head_sampling_rate\s*=\s*0\.05/);
+    expect(production).toMatch(/\[observability\.logs\][\s\S]*?head_sampling_rate\s*=\s*0\.05/);
+    expect(production).toMatch(/invocation_logs\s*=\s*false/);
+    expect(production).toMatch(/name\s*=\s*"COLLECT_RATE_LIMIT"/);
+    expect(production).toMatch(/namespace_id\s*=\s*"1001"/);
+    expect(production).toMatch(/simple\s*=\s*\{\s*limit\s*=\s*60,\s*period\s*=\s*60\s*\}/);
+    expect(sandbox).toMatch(/head_sampling_rate\s*=\s*0\.1/);
+    expect(sandbox).toMatch(/\[env\.sandbox\.observability\.logs\][\s\S]*?head_sampling_rate\s*=\s*0\.1/);
+    expect(sandbox).toMatch(/name\s*=\s*"COLLECT_RATE_LIMIT"/);
   });
 
   it("query.ts does not hardcode FROM manhali_analytics in SQL strings", () => {
@@ -170,5 +232,54 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
 
     captured.restore();
     clearDashboardSectionsCache();
+  });
+
+  it("getOverview is one SQL with unique visitors and avg time, not top pages", async () => {
+    const env = createQueryEnv(SANDBOX_DATASET);
+    const captured = captureSql(env);
+
+    const overview = await getOverview(env, "tenant_overview", 30);
+
+    captured.restore();
+    expect(captured.sql).toHaveLength(1);
+    expect(captured.sql[0]).toMatch(/unique_visitors/);
+    expect(captured.sql[0]).toMatch(/avg_time_on_page/);
+    expect(captured.sql[0]).not.toMatch(/GROUP BY page_path/);
+    expect(overview.topPages).toEqual([]);
+  });
+
+  it("Cache API serves a second overview after isolate L1 is cleared", async () => {
+    installMemoryCaches();
+    const env = createQueryEnv(SANDBOX_DATASET);
+    const captured = captureSql(env);
+
+    const first = await getOverview(env, "tenant_cache", 7);
+    expect(captured.sql).toHaveLength(1);
+    expect(first.uniqueVisitors).toBe(0);
+
+    clearAnalyticsQueryCache();
+    const second = await getOverview(env, "tenant_cache", 7);
+    expect(captured.sql).toHaveLength(1);
+    expect(second).toEqual(first);
+
+    captured.restore();
+  });
+
+  it("Cache API serves a second realtime and sections after isolate L1 is cleared", async () => {
+    installMemoryCaches();
+    const env = createQueryEnv(SANDBOX_DATASET);
+    const captured = captureSql(env);
+
+    await getRealtime(env, "tenant_rt");
+    await getDashboardSections(env, "tenant_sec", 7, 10);
+    const billed = captured.sql.length;
+    expect(billed).toBe(2 + 5);
+
+    clearAnalyticsQueryCache();
+    await getRealtime(env, "tenant_rt");
+    await getDashboardSections(env, "tenant_sec", 7, 10);
+    expect(captured.sql).toHaveLength(billed);
+
+    captured.restore();
   });
 });

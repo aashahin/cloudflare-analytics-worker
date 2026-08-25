@@ -7,7 +7,7 @@
 //   3. No D1 — Analytics Engine is the sole data store.
 
 import type { Env } from "@/env.ts";
-import { verifyAuth } from "@/lib/auth.ts";
+import { verifyAuth, verifyIngestAuth } from "@/lib/auth.ts";
 import {
   badRequest,
   forbidden,
@@ -182,6 +182,12 @@ async function handleCollect(
   request: Request,
   env: Env,
 ): Promise<Response> {
+  // Authenticated server-to-server ingest skips the public collect limiter.
+  if (!(await verifyIngestAuth(request, env))) {
+    const limited = await applyCollectRateLimit(request, env);
+    if (limited) return limited;
+  }
+
   // Guard against oversized payloads (64 KB limit for analytics)
   let rawText: string;
   try {
@@ -275,6 +281,26 @@ async function handleCollect(
     console.error("[Collect] Error:", error);
     return publicJsonResponse({ error: "Internal server error" }, 500);
   }
+}
+
+async function applyCollectRateLimit(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const limiter = env.COLLECT_RATE_LIMIT;
+  if (!limiter || typeof limiter.limit !== "function") return null;
+
+  try {
+    const ip = request.headers.get("CF-Connecting-IP")?.trim() || "unknown";
+    const { success } = await limiter.limit({ key: ip });
+    if (!success) {
+      return publicJsonResponse({ error: "Too many requests" }, 429);
+    }
+  } catch (error) {
+    // Fail open: a binding/runtime error must not drop browser collect.
+    console.error("[Collect] Rate limit check failed:", error);
+  }
+  return null;
 }
 
 class PayloadTooLargeError extends Error {}
