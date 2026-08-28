@@ -36,7 +36,7 @@ function utm(){
 }
 utm();
 
-function s(a,o,en,pp){
+function p(a,o,en,pp){
   var d={t:a,p:pp||location.pathname,r:n};
   if(sid)d.sid=sid;
   if(o)d.d=o;
@@ -44,6 +44,9 @@ function s(a,o,en,pp){
   if(_us)d.us=_us;
   if(_um)d.um=_um;
   if(_uc)d.uc=_uc;
+  return d;
+}
+function tx(d){
   try{
     var b=JSON.stringify(d);
     if(navigator.sendBeacon&&navigator.sendBeacon(e,b))return;
@@ -57,13 +60,15 @@ function s(a,o,en,pp){
     }
   }catch(err){}
 }
+function s(a,o,en,pp){tx(p(a,o,en,pp))}
 
-function sendBeacon(){
-  if(bs)return;
+function beacon(){
+  if(bs)return null;
   bs=true;
   var dur=Math.round((Date.now()-t)/1000);
-  if(dur>0)s("beacon",dur,0,lp);
+  return dur>0?p("beacon",dur,0,lp):null;
 }
+function sendBeacon(){var d=beacon();if(d)tx(d)}
 
 s("pageview");
 
@@ -79,13 +84,14 @@ window.addEventListener("pageshow",function(ev){
 
 function onNav(){
   if(location.pathname!==lp){
-    sendBeacon();
+    var previous=beacon();
     lp=location.pathname;
     t=Date.now();
     n="";
     bs=false;
     utm();
-    s("pageview");
+    var next=p("pageview");
+    tx(previous?{events:[previous,next]}:next);
   }
 }
 var oP=history.pushState;

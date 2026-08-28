@@ -17,7 +17,7 @@ import {
   publicJsonResponse,
   unauthorized,
 } from "@/lib/cors.ts";
-import { trackEvent } from "@/lib/ingest.ts";
+import { trackEvents, type IngestOptions } from "@/lib/ingest.ts";
 import {
   getCustomEvents,
   getDashboardSections,
@@ -39,6 +39,7 @@ import { handleAdminRoutes } from "@/routes/admin.ts";
 import { getTrackerHeaders, getTrackerScript } from "@/tracker/script.ts";
 
 const MAX_COLLECT_BODY_BYTES = 65_536;
+const MAX_COLLECT_EVENTS = 2;
 const QUERY_PATHS = new Set([
   "/api/overview",
   "/api/pages",
@@ -225,9 +226,13 @@ async function handleCollect(
 ): Promise<Response> {
   // Authenticated server-to-server ingest skips the public collect limiter.
   const ingestAuthenticated = await verifyIngestAuth(request, env);
+  let consumedIpQuotaUnits = 0;
   if (!ingestAuthenticated) {
-    const limited = await applyCollectRateLimit(request, env);
+    // Charge malformed/oversized unauthenticated requests before reading their
+    // body. A valid two-event batch consumes its second unit after parsing.
+    const limited = await applyCollectRateLimit(request, env, 1);
     if (limited) return limited;
+    consumedIpQuotaUnits = 1;
   }
 
   // Guard against oversized payloads (64 KB limit for analytics)
@@ -241,9 +246,9 @@ async function handleCollect(
     return publicJsonResponse({ error: "Failed to read body" }, 400);
   }
 
-  let body: CollectPayload;
+  let events: CollectPayload[];
   try {
-    body = parseCollectPayload(rawText);
+    events = parseCollectPayloads(rawText);
   } catch (error) {
     return publicJsonResponse(
       { error: error instanceof Error ? error.message : "Invalid payload" },
@@ -251,18 +256,30 @@ async function handleCollect(
     );
   }
 
+  const firstEvent = events[0]!;
   const serverToServer = Boolean(
-    ingestAuthenticated && body.tid && SAFE_TENANT_ID.test(body.tid),
+    ingestAuthenticated &&
+      firstEvent.tid &&
+      SAFE_TENANT_ID.test(firstEvent.tid),
   );
   // A valid token by itself is not a server-to-server event. Malformed or
   // browser-shaped payloads still consume the public quotas so they cannot use
   // an Authorization header to bypass the KV/ingest cost controls.
-  if (ingestAuthenticated && !serverToServer) {
-    const limited = await applyCollectRateLimit(request, env);
+  if (!serverToServer && events.length > consumedIpQuotaUnits) {
+    const limited = await applyCollectRateLimit(
+      request,
+      env,
+      events.length - consumedIpQuotaUnits,
+    );
     if (limited) return limited;
   }
   if (!serverToServer) {
-    const limited = await applySiteCollectRateLimit(request, env, body.sid);
+    const limited = await applySiteCollectRateLimit(
+      request,
+      env,
+      firstEvent.sid,
+      events.length,
+    );
     if (limited) return limited;
   }
 
@@ -274,7 +291,7 @@ async function handleCollect(
     const { tenantId, error, isServerToServer } = await resolveTenant(
       request,
       env,
-      body,
+      firstEvent,
       { ingestAuthenticated },
     );
     if (!tenantId) {
@@ -284,54 +301,13 @@ async function handleCollect(
       );
     }
 
-    // Map event type
-    const eventType =
-      body.t === "beacon"
-        ? EVENT_TYPES.BEACON
-        : body.t === "event"
-          ? EVENT_TYPES.EVENT
-          : EVENT_TYPES.PAGEVIEW;
-
-    // Sanitize inputs before ingestion
-    const timeOnPage = Math.max(0, Math.min(body.d ?? 0, 3600)); // Clamp 0-3600s
-    const eventName = (body.en ?? "")
-      .replace(/[^a-zA-Z0-9_\-. ]/g, "")
-      .slice(0, 100);
-
-    // Bound UTM fields. Unlike eventName/pagePath/city they are otherwise
-    // written verbatim to blobs 8/9/10; an oversized value (the body cap is
-    // 64 KB, far above AE's 16 KB per-data-point blob budget) would silently
-    // drop the entire data point, and unbounded values bloat GROUP BY
-    // cardinality in getTopReferrers.
-    const utmSource = (body.us ?? "").slice(0, 200);
-    const utmMedium = (body.um ?? "").slice(0, 200);
-    const utmCampaign = (body.uc ?? "").slice(0, 200);
-
-    // trackEvent is async due to the SHA-256 visitor hash computation.
-    // writeDataPoint() inside is fire-and-forget (no await needed for AE write).
-    // Accept country/city overrides only on authenticated server-to-server
-    // requests (those use body.tid + Bearer auth — verifyIngestAuth in
-    // resolveTenant). Validate country is a plausible 2-letter ISO code.
-    const countryOverride =
-      isServerToServer && body.co && /^[A-Z]{2}$/.test(body.co)
-        ? body.co
-        : undefined;
-    const cityOverride =
-      isServerToServer && body.ci ? body.ci.slice(0, 100) : undefined;
-
-    await trackEvent(request, env, {
-      tenantId,
-      pagePath: sanitizePath(body.p),
-      eventType,
-      eventName,
-      timeOnPage,
-      referrer: body.r ?? "",
-      utmSource,
-      utmMedium,
-      utmCampaign,
-      countryOverride,
-      cityOverride,
-    });
+    await trackEvents(
+      request,
+      env,
+      events.map((event) =>
+        buildCollectEvent({ event, tenantId, isServerToServer }),
+      ),
+    );
 
     // 204 No Content — minimal response for tracker
     return new Response(null, { status: 204, headers: publicCorsHeaders() });
@@ -341,9 +317,46 @@ async function handleCollect(
   }
 }
 
+function buildCollectEvent({
+  event,
+  tenantId,
+  isServerToServer,
+}: {
+  event: CollectPayload,
+  tenantId: string,
+  isServerToServer: boolean,
+}): IngestOptions {
+  const eventType =
+    event.t === "beacon"
+      ? EVENT_TYPES.BEACON
+      : event.t === "event"
+        ? EVENT_TYPES.EVENT
+        : EVENT_TYPES.PAGEVIEW;
+  const countryOverride =
+    isServerToServer && event.co && /^[A-Z]{2}$/.test(event.co)
+      ? event.co
+      : undefined;
+
+  return {
+    tenantId,
+    pagePath: sanitizePath(event.p),
+    eventType,
+    eventName: (event.en ?? "").replace(/[^a-zA-Z0-9_\-. ]/g, "").slice(0, 100),
+    timeOnPage: Math.max(0, Math.min(event.d ?? 0, 3600)),
+    referrer: event.r ?? "",
+    utmSource: (event.us ?? "").slice(0, 200),
+    utmMedium: (event.um ?? "").slice(0, 200),
+    utmCampaign: (event.uc ?? "").slice(0, 200),
+    countryOverride,
+    cityOverride:
+      isServerToServer && event.ci ? event.ci.slice(0, 100) : undefined,
+  };
+}
+
 async function applyCollectRateLimit(
   request: Request,
   env: Env,
+  units: number,
 ): Promise<Response | null> {
   const limiter = env.COLLECT_RATE_LIMIT;
   if (!limiter || typeof limiter.limit !== "function") {
@@ -370,9 +383,11 @@ async function applyCollectRateLimit(
 
   try {
     const ip = request.headers.get("CF-Connecting-IP")?.trim() || "unknown";
-    const { success } = await limiter.limit({ key: ip });
-    if (!success) {
-      return publicJsonResponse({ error: "Too many requests" }, 429);
+    for (let index = 0; index < units; index += 1) {
+      const { success } = await limiter.limit({ key: ip });
+      if (!success) {
+        return publicJsonResponse({ error: "Too many requests" }, 429);
+      }
     }
   } catch (error) {
     console.error(
@@ -396,6 +411,7 @@ async function applySiteCollectRateLimit(
   request: Request,
   env: Env,
   siteId: string | undefined,
+  units: number,
 ): Promise<Response | null> {
   const normalizedSiteId =
     siteId && SAFE_TENANT_ID.test(siteId) ? siteId : "invalid";
@@ -408,6 +424,7 @@ async function applySiteCollectRateLimit(
     [`site:${normalizedSiteId}`, `origin:${origin.toLowerCase()}`],
     env,
     "site_collect_rate_limit",
+    units,
   );
 }
 
@@ -458,17 +475,20 @@ async function applyPublicRateLimit(
   keys: readonly string[],
   env: Env,
   event: string,
+  units = 1,
 ): Promise<Response | null> {
   if (!limiter || typeof limiter.limit !== "function") {
     return rateLimitUnavailable(undefined, env, event);
   }
 
   try {
-    const results = await Promise.all(
-      keys.map((key) => limiter.limit({ key })),
-    );
-    if (results.some(({ success }) => !success)) {
-      return publicJsonResponse({ error: "Too many requests" }, 429);
+    for (let index = 0; index < units; index += 1) {
+      const results = await Promise.all(
+        keys.map((key) => limiter.limit({ key })),
+      );
+      if (results.some(({ success }) => !success)) {
+        return publicJsonResponse({ error: "Too many requests" }, 429);
+      }
     }
   } catch (error) {
     logRateLimitFailure(env, event, error);
@@ -545,7 +565,7 @@ async function readLimitedText(request: Request, maxBytes: number): Promise<stri
   return text;
 }
 
-function parseCollectPayload(rawText: string): CollectPayload {
+function parseCollectPayloads(rawText: string): CollectPayload[] {
   let raw: unknown;
   try {
     raw = JSON.parse(rawText);
@@ -555,6 +575,28 @@ function parseCollectPayload(rawText: string): CollectPayload {
 
   if (!isRecord(raw)) {
     throw new Error("Invalid JSON body");
+  }
+
+  const rawEvents = Array.isArray(raw.events) ? raw.events : [raw];
+  if (rawEvents.length === 0 || rawEvents.length > MAX_COLLECT_EVENTS) {
+    throw new Error("Collect batch must contain one or two events");
+  }
+
+  const events = rawEvents.map(parseCollectPayload);
+  const firstEvent = events[0]!;
+  if (
+    events.some(
+      (event) => event.sid !== firstEvent.sid || event.tid !== firstEvent.tid,
+    )
+  ) {
+    throw new Error("Collect batch events must share tenant identity");
+  }
+  return events;
+}
+
+function parseCollectPayload(raw: unknown): CollectPayload {
+  if (!isRecord(raw)) {
+    throw new Error("Invalid collect event");
   }
 
   if (!isEventType(raw.t)) {

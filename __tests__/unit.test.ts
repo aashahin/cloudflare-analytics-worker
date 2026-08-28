@@ -710,6 +710,110 @@ describe("collect endpoint", () => {
     expect(dataPoints[0]?.indexes?.[0]).toBe("tenant_1");
   });
 
+  it("accepts one navigation batch with the previous beacon and next pageview", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const ipLimiter = createFakeRateLimiter();
+    const siteLimiter = createFakeRateLimiter();
+    const env = createMockEnv(dataPoints, {
+      rateLimit: ipLimiter,
+      siteRateLimit: siteLimiter,
+    });
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain;charset=UTF-8",
+          Origin: "https://example.com",
+          "User-Agent": browserUa,
+        },
+        body: JSON.stringify({
+          events: [
+            { t: "beacon", p: "/courses", d: 7, sid: "tenant_1" },
+            { t: "pageview", p: "/products", sid: "tenant_1" },
+          ],
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(204);
+    expect(dataPoints).toHaveLength(2);
+    expect(dataPoints.map((point) => point.blobs?.[1])).toEqual([
+      "/courses",
+      "/products",
+    ]);
+    expect(dataPoints.map((point) => point.blobs?.[10])).toEqual([
+      "beacon",
+      "pageview",
+    ]);
+    expect(ipLimiter.keys).toEqual(["unknown", "unknown"]);
+    expect(siteLimiter.keys).toEqual([
+      "site:tenant_1",
+      "origin:example.com",
+      "site:tenant_1",
+      "origin:example.com",
+    ]);
+  });
+
+  it("rejects the whole batch when the second event exhausts IP quota", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const ipLimiter = createFakeRateLimiter({ results: [true, false] });
+    const siteLimiter = createFakeRateLimiter();
+    const env = createMockEnv(dataPoints, {
+      rateLimit: ipLimiter,
+      siteRateLimit: siteLimiter,
+    });
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          Origin: "https://example.com",
+          "User-Agent": browserUa,
+          "CF-Connecting-IP": "203.0.113.70",
+        },
+        body: JSON.stringify({
+          events: [
+            { t: "beacon", p: "/courses", sid: "tenant_1" },
+            { t: "pageview", p: "/products", sid: "tenant_1" },
+          ],
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(429);
+    expect(ipLimiter.keys).toEqual(["203.0.113.70", "203.0.113.70"]);
+    expect(siteLimiter.keys).toEqual([]);
+    expect(dataPoints).toEqual([]);
+  });
+
+  it("rejects a navigation batch that mixes tenant identities", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints);
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          Origin: "https://example.com",
+          "User-Agent": browserUa,
+        },
+        body: JSON.stringify({
+          events: [
+            { t: "beacon", p: "/courses", sid: "tenant_1" },
+            { t: "pageview", p: "/products", sid: "tenant_2" },
+          ],
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(400);
+    expect(dataPoints).toHaveLength(0);
+  });
+
   it("returns 429 with public CORS when the collect rate limit is exceeded", async () => {
     const limiter = createFakeRateLimiter({ success: false });
     const dataPoints: AnalyticsEngineDataPoint[] = [];
@@ -952,6 +1056,15 @@ describe("tracker script", () => {
     expect(script).toContain("keepalive:true");
     expect(script).toContain("\"Content-Type\":\"text/plain;charset=UTF-8\"");
   });
+
+  it("sends one collect request for a client-side navigation", () => {
+    const script = getTrackerScript(
+      "https://analytics.example.com/api/collect",
+      "tenant_1",
+    );
+
+    expect(script).toContain("events:[previous,next]");
+  });
 });
 
 // ─── Domain Allowlist Enforcement (collect) ──────────────────────────────────
@@ -1023,7 +1136,11 @@ interface FakeRateLimiter extends RateLimit {
 }
 
 function createFakeRateLimiter(
-  opts: { success?: boolean; throws?: boolean } = {},
+  opts: {
+    success?: boolean;
+    throws?: boolean;
+    results?: readonly boolean[];
+  } = {},
 ): FakeRateLimiter {
   const keys: string[] = [];
   return {
@@ -1031,7 +1148,8 @@ function createFakeRateLimiter(
     async limit({ key }: RateLimitOptions) {
       keys.push(key);
       if (opts.throws) throw new Error("rate limiter unavailable");
-      return { success: opts.success ?? true };
+      const sequenced = opts.results?.[keys.length - 1];
+      return { success: sequenced ?? opts.success ?? true };
     },
   };
 }
