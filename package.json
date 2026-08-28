@@ -8,8 +8,11 @@
   },
   "private": true,
   "scripts": {
+    "build:cf:production": "wrangler deploy --dry-run --config wrangler.toml --env=\"\" --outdir .wrangler-build/production",
+    "build:cf:sandbox": "wrangler deploy --dry-run --config wrangler.toml --env sandbox",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy:production": "bun ../../../scripts/release/cloudflare/production-entrypoint.ts --worker manhali-analytics",
+    "deploy:sandbox": "wrangler deploy --config wrangler.toml --env sandbox",
     "tail": "wrangler tail",
     "test": "bun test"
   },

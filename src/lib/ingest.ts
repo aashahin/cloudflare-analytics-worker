@@ -40,23 +40,28 @@ export async function trackEvent(
   env: Env,
   options: IngestOptions,
 ): Promise<void> {
-  const {
-    tenantId,
-    pagePath,
-    eventType = EVENT_TYPES.PAGEVIEW,
-    eventName = "",
-    timeOnPage = 0,
-    referrer: rawReferrer,
-    utmSource: optUtmSource,
-    utmMedium: optUtmMedium,
-    utmCampaign: optUtmCampaign,
-    countryOverride,
-    cityOverride,
-  } = options;
+  return trackEvents(request, env, [options]);
+}
+
+/**
+ * Track a small group of events received in one request while calculating the
+ * privacy-safe visitor fingerprint and request metadata only once.
+ */
+export async function trackEvents(
+  request: Request,
+  env: Env,
+  options: readonly IngestOptions[],
+): Promise<void> {
+  if (options.length === 0) return;
 
   // ─── Bot Filtering (UA-based, free tier) ─────────────────────────────────
   const userAgent = request.headers.get("User-Agent") ?? "";
   if (isBot(userAgent)) return;
+
+  const tenantId = options[0]!.tenantId;
+  if (options.some((event) => event.tenantId !== tenantId)) {
+    throw new Error("Ingest batches must share one tenant identity");
+  }
 
   // ─── Extract Request Metadata ────────────────────────────────────────────
 
@@ -75,54 +80,36 @@ export async function trackEvent(
     env.FINGERPRINT_SECRET,
   );
 
-  // Geo data (provided free by Cloudflare on every request).
-  // Server-to-server requests may supply overrides (e.g. seed scripts).
   const cf = request.cf as IncomingRequestCfProperties | undefined;
-  const country = countryOverride || (cf?.country as string) || "XX";
-  const city = cityOverride || (cf?.city as string) || "";
-
-  // Device type from UA
   const deviceType = parseDeviceType(userAgent);
-
-  // Referrer: prefer the explicitly passed value (document.referrer from tracker),
-  // which is the actual external referrer. The request's Referer header points to
-  // the page making the beacon call, which is the tenant's own page — not useful.
   const originHost = extractHostname(request.headers.get("Origin")) ?? "";
-  // cleanReferrer already reduces to a hostname; cap length as defense-in-depth
-  // so no single blob can grow toward the 16 KB per-data-point blob budget.
-  const referrer = rawReferrer
-    ? cleanReferrer(rawReferrer, originHost).slice(0, 253)
-    : "";
 
-  // UTM: prefer values from collect body (tracker extracts from the page URL).
-  // The worker's own URL (/api/collect) never has UTM params.
-  const utmSource = optUtmSource ?? "";
-  const utmMedium = optUtmMedium ?? "";
-  const utmCampaign = optUtmCampaign ?? "";
+  for (const event of options) {
+    const eventType = event.eventType ?? EVENT_TYPES.PAGEVIEW;
+    const referrer = event.referrer
+      ? cleanReferrer(event.referrer, originHost).slice(0, 253)
+      : "";
 
-  // ─── Write Data Point ────────────────────────────────────────────────────
-  // writeDataPoint() is fire-and-forget — no await needed.
-  // The Workers runtime handles persistence in the background.
-
-  env.ANALYTICS.writeDataPoint({
-    indexes: [tenantId],
-    blobs: [
-      tenantId, // blob1
-      pagePath, // blob2
-      visitorHash, // blob3
-      country, // blob4
-      city, // blob5
-      deviceType, // blob6
-      referrer, // blob7
-      utmSource, // blob8
-      utmMedium, // blob9
-      utmCampaign, // blob10
-      eventType, // blob11
-      eventName, // blob12 — custom event name
-    ],
-    doubles: [
-      eventType === EVENT_TYPES.PAGEVIEW ? 1 : 0, // double1 — only count for pageviews
-      timeOnPage, // double2 — seconds on page (from beacon)
-    ],
-  });
+    env.ANALYTICS.writeDataPoint({
+      indexes: [tenantId],
+      blobs: [
+        tenantId,
+        event.pagePath,
+        visitorHash,
+        event.countryOverride || (cf?.country as string) || "XX",
+        event.cityOverride || (cf?.city as string) || "",
+        deviceType,
+        referrer,
+        event.utmSource ?? "",
+        event.utmMedium ?? "",
+        event.utmCampaign ?? "",
+        eventType,
+        event.eventName ?? "",
+      ],
+      doubles: [
+        eventType === EVENT_TYPES.PAGEVIEW ? 1 : 0,
+        event.timeOnPage ?? 0,
+      ],
+    });
+  }
 }

@@ -78,6 +78,7 @@ There is no D1 or other persistent application database in this worker.
 - `GET /api/devices`
 - `GET /api/realtime`
 - `GET /api/events`
+- `GET /api/sections`
 
 All query routes require `tenant_id`, except that `/api/realtime` only needs `tenant_id` and no extra filters.
 
@@ -151,7 +152,10 @@ KV values are stored as JSON arrays:
 domains:tenant_123 -> ["example.com", "www.example.com"]
 ```
 
-The worker caches these lookups in memory for five minutes per isolate.
+The worker keeps successful lookups in a 256-entry LRU for five minutes per
+isolate. Missing/malformed entries use a separate 64-entry, 30-second negative
+LRU, so random valid unknown site IDs cannot evict known tenants. KV edge-cache
+TTL is 60 seconds. The site/origin limiter is checked before this lookup.
 
 If a production site has no registered domains:
 
@@ -224,13 +228,16 @@ The worker returns `204 No Content` for successful collect requests.
 
 `src/lib/query.ts` contains the pre-built Analytics Engine SQL queries for:
 
-- overview totals plus top pages
+- slim overview totals (views, unique visitors, avg time-on-page) in one SQL
 - page rankings
 - referrers and UTM sources
 - geographic breakdown
 - device breakdown
 - realtime visitors
 - custom events
+- batched dashboard sections
+
+Overview, realtime, and sections results are cached 60s (bounded isolate Map L1 + Workers Cache API) so dashboard polls do not re-bill Analytics Engine SQL. `/api/sections` still needs five exact grouped queries: Analytics Engine does not support `UNION`/`JOIN`, and combining the dimensions into one bounded result would silently truncate or approximate per-section counts. The longer shared cache, canonical parameter buckets, in-flight coalescing, and query quota bound that unavoidable fan-out.
 
 Visitor counts returned as `uniqueVisitors` are unique daily visitors. The underlying visitor hash intentionally rotates every UTC day, so these values should not be interpreted as a cross-day person count.
 
@@ -253,8 +260,8 @@ The query layer validates `tenantId` before embedding it into SQL and escapes si
 
 ### Input validation
 
-- `days` bounded to `1..90`
-- `limit` bounded to `1..100`
+- `days` canonicalized to `1`, `7`, `30`, or `90`
+- `limit` canonicalized to `10`, `20`, `50`, or `100`
 - hostnames validated before domain writes
 - country overrides limited to two uppercase letters
 
@@ -265,7 +272,15 @@ The query layer validates `tenantId` before embedding it into SQL and escapes si
 - No client-side fingerprinting
 - Visitor identity rotates daily, preventing cross-day tracking
 
-Rate limiting is expected to be configured at Cloudflare's edge rather than inside the worker.
+`POST /api/collect` is rate-limited in-worker, per Cloudflare location, at 120
+events/minute per `CF-Connecting-IP` and 1,200 events/minute per site plus per
+origin. The first threshold allows 60 complete pageview+beacon lifecycles per
+minute; the second caps 600 lifecycles and runs before domain KV. Authenticated
+server-to-server ingest skips both public limits. Authenticated query routes
+have separate 60 requests/minute/location counters for a SHA-256-derived token
+subject and for its tenant/token pair, so changing tenant IDs cannot evade the
+token-wide cap. All three bindings fail closed outside local development;
+exceeded limits return `429` with the appropriate CORS policy.
 
 ---
 

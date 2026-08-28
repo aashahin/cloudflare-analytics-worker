@@ -8,17 +8,22 @@ import type { Env } from "@/env.ts";
 
 const BEARER_PREFIX = "Bearer ";
 
-export function timingSafeEqual(a: string, b: string): boolean {
+/**
+ * Compare secrets without leaking length via an early return. Both sides are
+ * SHA-256 hashed first so `timingSafeEqual` always runs on 32-byte digests.
+ */
+export async function timingSafeEqual(a: string, b: string): Promise<boolean> {
   const encoder = new TextEncoder();
-  const bufA = encoder.encode(a);
-  const bufB = encoder.encode(b);
-  if (bufA.byteLength !== bufB.byteLength) return false;
+  const [digestA, digestB] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(a)),
+    crypto.subtle.digest("SHA-256", encoder.encode(b)),
+  ]);
+  const bufA = new Uint8Array(digestA);
+  const bufB = new Uint8Array(digestB);
 
   // crypto.subtle.timingSafeEqual is a Cloudflare Workers extension and is used
   // whenever available (the production runtime). Fall back to a manual
-  // constant-time comparison on runtimes that lack it (e.g. the test env), so
-  // this security-critical primitive stays portable and unit-testable. Lengths
-  // are already equal here, so the loop below is genuinely constant-time.
+  // constant-time comparison on runtimes that lack it (e.g. the test env).
   const subtle = crypto.subtle as SubtleCrypto & {
     timingSafeEqual?: (a: ArrayBufferView, b: ArrayBufferView) => boolean;
   };
@@ -78,7 +83,7 @@ export async function verifyAuth(
   if (!token || !authSecret) return { authenticated: false };
 
   // Admin token — unrestricted access to all tenants
-  if (timingSafeEqual(token, authSecret)) {
+  if (await timingSafeEqual(token, authSecret)) {
     return { authenticated: true };
   }
 
@@ -92,7 +97,10 @@ export async function verifyAuth(
 }
 
 /** Verify server-to-server ingestion auth (uses INGEST_TOKEN if set, else AUTH_TOKEN) */
-export function verifyIngestAuth(request: Request, env: Env): boolean {
+export async function verifyIngestAuth(
+  request: Request,
+  env: Env,
+): Promise<boolean> {
   const token = readBearerToken(request);
   const authSecret = configuredSecret(env.AUTH_TOKEN, "AUTH_TOKEN");
   if (!token || !authSecret) return false;
@@ -147,7 +155,7 @@ async function verifyScopedToken(
   const payload = `scoped:${tenantId}:${expiryStr}`;
   const expectedHmac = await hmacSign(secret, payload);
 
-  if (!timingSafeEqual(expectedHmac, providedHmac)) return null;
+  if (!(await timingSafeEqual(expectedHmac, providedHmac))) return null;
   return { tenantId };
 }
 

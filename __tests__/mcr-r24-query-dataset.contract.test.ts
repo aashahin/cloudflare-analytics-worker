@@ -10,7 +10,14 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Env } from "../src/env.ts";
-import { getRealtime, getTopPages } from "../src/lib/query.ts";
+import {
+  clearAnalyticsQueryCache,
+  clearDashboardSectionsCache,
+  getDashboardSections,
+  getOverview,
+  getRealtime,
+  getTopPages,
+} from "../src/lib/query.ts";
 
 const PRODUCTION_DATASET = "manhali_analytics";
 const SANDBOX_DATASET = "manhali_analytics_sandbox";
@@ -22,9 +29,16 @@ const wranglerPath = join(import.meta.dir, "../wrangler.toml");
 const querySourcePath = join(import.meta.dir, "../src/lib/query.ts");
 
 const originalFetch = globalThis.fetch;
+const originalCaches = (globalThis as { caches?: CacheStorage }).caches;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  if (originalCaches === undefined) {
+    delete (globalThis as { caches?: CacheStorage }).caches;
+  } else {
+    (globalThis as { caches?: CacheStorage }).caches = originalCaches;
+  }
+  clearAnalyticsQueryCache();
 });
 
 function emptyEngineResponse(): Response {
@@ -57,6 +71,21 @@ function createQueryEnv(dataset?: string): Env {
   return {
     ANALYTICS: { writeDataPoint() {} },
     DOMAINS_KV: { get: async () => null } as KVNamespace,
+    COLLECT_RATE_LIMIT: {
+      async limit() {
+        return { success: true };
+      },
+    },
+    SITE_COLLECT_RATE_LIMIT: {
+      async limit() {
+        return { success: true };
+      },
+    },
+    QUERY_RATE_LIMIT: {
+      async limit() {
+        return { success: true };
+      },
+    },
     AUTH_TOKEN: "admin-secret",
     CF_API_TOKEN: "cf-secret",
     FINGERPRINT_SECRET: "fingerprint-secret",
@@ -65,6 +94,44 @@ function createQueryEnv(dataset?: string): Env {
     ALLOW_UNREGISTERED_DOMAINS: "true",
     ...(dataset !== undefined ? { ANALYTICS_DATASET: dataset } : {}),
   };
+}
+
+function installMemoryCaches(): void {
+  const buckets = new Map<string, Map<string, string>>();
+  (globalThis as { caches: CacheStorage }).caches = {
+    open: async (name: string) => {
+      let store = buckets.get(name);
+      if (!store) {
+        store = new Map();
+        buckets.set(name, store);
+      }
+      const entries = store;
+      return {
+        match: async (request: RequestInfo | URL) => {
+          const url = request instanceof Request ? request.url : String(request);
+          const body = entries.get(url);
+          if (body === undefined) return undefined;
+          return new Response(body, {
+            headers: { "content-type": "application/json" },
+          });
+        },
+        put: async (request: RequestInfo | URL, response: Response) => {
+          const url = request instanceof Request ? request.url : String(request);
+          entries.set(url, await response.clone().text());
+        },
+        delete: async () => false,
+        keys: async () => [],
+        add: async () => undefined,
+        addAll: async () => undefined,
+        matchAll: async () => [],
+      } as Cache;
+    },
+    default: undefined as unknown as Cache,
+    delete: async () => false,
+    has: async () => false,
+    keys: async () => [],
+    match: async () => undefined,
+  } as CacheStorage;
 }
 
 function fromClause(dataset: string): RegExp {
@@ -85,6 +152,57 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
       expect(sql).toMatch(fromClause(SANDBOX_DATASET));
       expect(sql).not.toMatch(fromClause(PRODUCTION_DATASET));
     }
+  });
+
+  it("does not overlap the two realtime Analytics Engine SQL requests", async () => {
+    const env = createQueryEnv(SANDBOX_DATASET);
+    let active = 0;
+    let maxActive = 0;
+    let calls = 0;
+
+    globalThis.fetch = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      calls += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      const sql = String(init?.body ?? "");
+
+      // Model the transient upstream rejection observed when cold realtime
+      // queries overlap. The production fix must avoid the overlap, not retry.
+      await Promise.resolve();
+      const overloaded = active > 1;
+      active -= 1;
+      if (overloaded) {
+        return new Response("too many concurrent analytics queries", {
+          status: 429,
+          headers: { "cf-ray": "test-ray" },
+        });
+      }
+
+      const data = sql.includes("AS current_visitors")
+        ? [{ current_visitors: "3" }]
+        : [{ page_path: "/courses", visitors: "2" }];
+      return new Response(
+        JSON.stringify({
+          data,
+          rows: data.length,
+          rows_before_limit_at_least: 0,
+          meta: [],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const result = await getRealtime(env, "tenant_realtime_sequential");
+
+    expect(calls).toBe(2);
+    expect(maxActive).toBe(1);
+    expect(result).toEqual({
+      currentVisitors: 3,
+      topPages: [{ pagePath: "/courses", visitors: 2 }],
+    });
   });
 
   it("production default stays manhali_analytics when ANALYTICS_DATASET is unset", async () => {
@@ -133,11 +251,143 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
     expect(sandbox).toMatch(
       /ANALYTICS_DATASET\s*=\s*"manhali_analytics_sandbox"/,
     );
+
+    expect(production).toMatch(/head_sampling_rate\s*=\s*0\.05/);
+    expect(production).toMatch(/\[observability\.logs\][\s\S]*?head_sampling_rate\s*=\s*0\.05/);
+    expect(production).toMatch(/invocation_logs\s*=\s*false/);
+    expect(production).toMatch(/name\s*=\s*"COLLECT_RATE_LIMIT"/);
+    expect(production).toMatch(/namespace_id\s*=\s*"1101"/);
+    expect(production).toMatch(/simple\s*=\s*\{\s*limit\s*=\s*120,\s*period\s*=\s*60\s*\}/);
+    expect(production).toMatch(/name\s*=\s*"SITE_COLLECT_RATE_LIMIT"/);
+    expect(production).toMatch(/namespace_id\s*=\s*"1102"/);
+    expect(production).toMatch(/name\s*=\s*"QUERY_RATE_LIMIT"/);
+    expect(production).toMatch(/namespace_id\s*=\s*"1103"/);
+    expect(sandbox).toMatch(/head_sampling_rate\s*=\s*0\.1/);
+    expect(sandbox).toMatch(/\[env\.sandbox\.observability\.logs\][\s\S]*?head_sampling_rate\s*=\s*0\.1/);
+    expect(sandbox).toMatch(/invocation_logs\s*=\s*false/);
+    expect(sandbox).toMatch(/name\s*=\s*"COLLECT_RATE_LIMIT"/);
+    expect(sandbox).toMatch(/namespace_id\s*=\s*"2101"/);
+    expect(sandbox).toMatch(/name\s*=\s*"SITE_COLLECT_RATE_LIMIT"/);
+    expect(sandbox).toMatch(/namespace_id\s*=\s*"2102"/);
+    expect(sandbox).toMatch(/name\s*=\s*"QUERY_RATE_LIMIT"/);
+    expect(sandbox).toMatch(/namespace_id\s*=\s*"2103"/);
+    expect(production).toMatch(/\[limits\][\s\S]*?cpu_ms\s*=\s*500/);
+    expect(sandbox).toMatch(/\[env\.sandbox\.limits\]/);
+    expect(sandbox).not.toMatch(/cpu_ms\s*=/);
   });
 
   it("query.ts does not hardcode FROM manhali_analytics in SQL strings", () => {
     const source = readFileSync(querySourcePath, "utf8");
     expect(source).not.toMatch(/FROM\s+manhali_analytics\s*$/m);
     expect(source).toMatch(/ANALYTICS_DATASET/);
+  });
+
+  it("dashboard sections fan-out is one cacheable round trip per tenant window", async () => {
+    clearDashboardSectionsCache();
+    const env = createQueryEnv(SANDBOX_DATASET);
+    const captured = captureSql(env);
+
+    const first = await getDashboardSections(env, "tenant_sections", 7, 10);
+    expect(captured.sql).toHaveLength(5);
+    expect(first.errors).toEqual({
+      pages: false,
+      referrers: false,
+      geo: false,
+      devices: false,
+      events: false,
+    });
+    for (const sql of captured.sql) {
+      expect(sql).toMatch(fromClause(SANDBOX_DATASET));
+    }
+
+    const second = await getDashboardSections(env, "tenant_sections", 7, 10);
+    expect(captured.sql).toHaveLength(5);
+    expect(second.errors).toEqual(first.errors);
+
+    captured.restore();
+    clearDashboardSectionsCache();
+  });
+
+  it("getOverview is one SQL with unique visitors and avg time, not top pages", async () => {
+    const env = createQueryEnv(SANDBOX_DATASET);
+    const captured = captureSql(env);
+
+    const overview = await getOverview(env, "tenant_overview", 30);
+
+    captured.restore();
+    expect(captured.sql).toHaveLength(1);
+    expect(captured.sql[0]).toMatch(/unique_visitors/);
+    expect(captured.sql[0]).toMatch(/avg_time_on_page/);
+    expect(captured.sql[0]).toMatch(
+      /SUM\(if\(blob11 = 'beacon', double2 \* _sample_interval, 0\)\)\s*\/\s*SUM\(if\(blob11 = 'beacon', _sample_interval, 0\)\)/,
+    );
+    expect(captured.sql[0]).not.toMatch(/AVG\(if\(blob11 = 'beacon'/);
+    expect(captured.sql[0]).not.toMatch(/GROUP BY page_path/);
+    expect(overview.topPages).toEqual([]);
+  });
+
+  it("coalesces concurrent cold queries for the same tenant window", async () => {
+    const env = createQueryEnv(SANDBOX_DATASET);
+    let release!: () => void;
+    let markStarted!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const sql: string[] = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      sql.push(String(init?.body ?? ""));
+      markStarted();
+      await gate;
+      return emptyEngineResponse();
+    }) as typeof fetch;
+
+    const first = getOverview(env, "tenant_coalesced", 7);
+    const second = getOverview(env, "tenant_coalesced", 7);
+    await started;
+    try {
+      expect(sql).toHaveLength(1);
+    } finally {
+      release();
+    }
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+    expect(sql).toHaveLength(1);
+  });
+
+  it("Cache API serves a second overview after isolate L1 is cleared", async () => {
+    installMemoryCaches();
+    const env = createQueryEnv(SANDBOX_DATASET);
+    const captured = captureSql(env);
+
+    const first = await getOverview(env, "tenant_cache", 7);
+    expect(captured.sql).toHaveLength(1);
+    expect(first.uniqueVisitors).toBe(0);
+
+    clearAnalyticsQueryCache();
+    const second = await getOverview(env, "tenant_cache", 7);
+    expect(captured.sql).toHaveLength(1);
+    expect(second).toEqual(first);
+
+    captured.restore();
+  });
+
+  it("Cache API serves a second realtime and sections after isolate L1 is cleared", async () => {
+    installMemoryCaches();
+    const env = createQueryEnv(SANDBOX_DATASET);
+    const captured = captureSql(env);
+
+    await getRealtime(env, "tenant_rt");
+    await getDashboardSections(env, "tenant_sec", 7, 10);
+    const billed = captured.sql.length;
+    expect(billed).toBe(2 + 5);
+
+    clearAnalyticsQueryCache();
+    await getRealtime(env, "tenant_rt");
+    await getDashboardSections(env, "tenant_sec", 7, 10);
+    expect(captured.sql).toHaveLength(billed);
+
+    captured.restore();
   });
 });

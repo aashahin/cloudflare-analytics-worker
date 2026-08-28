@@ -40,13 +40,22 @@ export interface CollectPayload {
 // Resets naturally when the Worker isolate is recycled (every few minutes).
 
 const DOMAIN_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const DOMAIN_NEGATIVE_CACHE_TTL_MS = 30 * 1000;
+const DOMAIN_KV_CACHE_TTL_SECONDS = 60;
+const DOMAIN_POSITIVE_CACHE_MAX_ENTRIES = 256;
+const DOMAIN_NEGATIVE_CACHE_MAX_ENTRIES = 64;
 
-interface CacheEntry {
-  domains: string[] | null; // null = no domains registered (grace period)
+interface PositiveCacheEntry {
+  domains: string[];
   expiresAt: number;
 }
 
-const domainCache = new Map<string, CacheEntry>();
+interface NegativeCacheEntry {
+  expiresAt: number;
+}
+
+const positiveDomainCache = new Map<string, PositiveCacheEntry>();
+const negativeDomainCache = new Map<string, NegativeCacheEntry>();
 
 /** Get the KV namespace for domain allowlist */
 export function getDomainKV(env: Env): KVNamespace {
@@ -58,15 +67,55 @@ async function getCachedDomains(
   siteId: string,
 ): Promise<string[] | null> {
   const now = Date.now();
-  const cached = domainCache.get(siteId);
-  if (cached && cached.expiresAt > now) {
-    return cached.domains;
+  const positive = positiveDomainCache.get(siteId);
+  if (positive && positive.expiresAt > now) {
+    // Refresh insertion order so overflow evicts the least recently used site.
+    positiveDomainCache.delete(siteId);
+    positiveDomainCache.set(siteId, positive);
+    return positive.domains;
+  }
+  if (positive) positiveDomainCache.delete(siteId);
+
+  const negative = negativeDomainCache.get(siteId);
+  if (negative && negative.expiresAt > now) {
+    negativeDomainCache.delete(siteId);
+    negativeDomainCache.set(siteId, negative);
+    return null;
+  }
+  if (negative) negativeDomainCache.delete(siteId);
+
+  const raw = await getDomainKV(env).get(`domains:${siteId}`, {
+    type: "text",
+    cacheTtl: DOMAIN_KV_CACHE_TTL_SECONDS,
+  });
+  const domains = parseDomainList(raw);
+  if (domains) {
+    negativeDomainCache.delete(siteId);
+    pruneOldest(
+      positiveDomainCache,
+      DOMAIN_POSITIVE_CACHE_MAX_ENTRIES,
+    );
+    positiveDomainCache.set(siteId, {
+      domains,
+      expiresAt: now + DOMAIN_CACHE_TTL_MS,
+    });
+    return domains;
   }
 
-  const raw = await getDomainKV(env).get(`domains:${siteId}`);
-  const domains = parseDomainList(raw);
-  domainCache.set(siteId, { domains, expiresAt: now + DOMAIN_CACHE_TTL_MS });
-  return domains;
+  positiveDomainCache.delete(siteId);
+  pruneOldest(negativeDomainCache, DOMAIN_NEGATIVE_CACHE_MAX_ENTRIES);
+  negativeDomainCache.set(siteId, {
+    expiresAt: now + DOMAIN_NEGATIVE_CACHE_TTL_MS,
+  });
+  return null;
+}
+
+function pruneOldest<T>(cache: Map<string, T>, maxEntries: number): void {
+  while (cache.size >= maxEntries) {
+    const oldest = cache.keys().next().value;
+    if (!oldest) return;
+    cache.delete(oldest);
+  }
 }
 
 export function parseDomainList(raw: string | null): string[] | null {
@@ -98,7 +147,27 @@ export function normalizeHostname(hostname: string): string | null {
 
 /** Invalidate cached domains for a tenant (call after admin add/remove). */
 export function invalidateDomainCache(siteId: string): void {
-  domainCache.delete(siteId);
+  positiveDomainCache.delete(siteId);
+  negativeDomainCache.delete(siteId);
+}
+
+export function clearDomainCacheForTests(): void {
+  positiveDomainCache.clear();
+  negativeDomainCache.clear();
+}
+
+export function getDomainCacheSizeForTests(): number {
+  return positiveDomainCache.size + negativeDomainCache.size;
+}
+
+export function getDomainCacheSizesForTests(): {
+  positive: number;
+  negative: number;
+} {
+  return {
+    positive: positiveDomainCache.size,
+    negative: negativeDomainCache.size,
+  };
 }
 
 // ─── Tenant Resolution ──────────────────────────────────────────────────────
@@ -115,13 +184,17 @@ export async function resolveTenant(
   request: Request,
   env: Env,
   body: CollectPayload,
+  options: { ingestAuthenticated?: boolean } = {},
 ): Promise<{
   tenantId: string | null;
   error?: string;
   isServerToServer: boolean;
 }> {
   // Server-to-server with Bearer auth — trust body.tid (uses INGEST_TOKEN if set)
-  if (body.tid && verifyIngestAuth(request, env)) {
+  if (
+    body.tid &&
+    (options.ingestAuthenticated ?? (await verifyIngestAuth(request, env)))
+  ) {
     if (!SAFE_TENANT_ID.test(body.tid)) {
       return {
         tenantId: null,
@@ -160,18 +233,11 @@ export async function resolveTenant(
           };
         }
       } else if (env.ALLOW_UNREGISTERED_DOMAINS !== "true") {
-        console.warn(
-          `[Tenant] No domains registered for site ${siteId}, rejecting. Set ALLOW_UNREGISTERED_DOMAINS=true to allow.`,
-        );
         return {
           tenantId: null,
           error: "No domains registered for this site",
           isServerToServer: false,
         };
-      } else {
-        console.warn(
-          `[Tenant] Grace period: allowing unregistered site ${siteId}`,
-        );
       }
     }
     return { tenantId: siteId, isServerToServer: false };
