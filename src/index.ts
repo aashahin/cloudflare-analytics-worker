@@ -30,11 +30,39 @@ import {
 } from "@/lib/query.ts";
 import { EVENT_TYPES } from "@/lib/schema.ts";
 import { type CollectPayload, resolveTenant } from "@/lib/tenant.ts";
-import { safeInt, SAFE_TENANT_ID, sanitizePath } from "@/lib/utils.ts";
+import {
+  extractHostname,
+  SAFE_TENANT_ID,
+  sanitizePath,
+} from "@/lib/utils.ts";
 import { handleAdminRoutes } from "@/routes/admin.ts";
 import { getTrackerHeaders, getTrackerScript } from "@/tracker/script.ts";
 
 const MAX_COLLECT_BODY_BYTES = 65_536;
+const QUERY_PATHS = new Set([
+  "/api/overview",
+  "/api/pages",
+  "/api/referrers",
+  "/api/geo",
+  "/api/devices",
+  "/api/realtime",
+  "/api/events",
+  "/api/sections",
+]);
+export const QUERY_DAY_BUCKETS = [1, 7, 30, 90] as const;
+export const QUERY_LIMIT_BUCKETS = [10, 20, 50, 100] as const;
+
+export function canonicalQueryBucket(
+  raw: string | null,
+  buckets: readonly number[],
+  fallback: number,
+): number {
+  if (raw === null || raw.trim() === "") return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  const integer = Math.trunc(parsed);
+  return buckets.find((bucket) => integer <= bucket) ?? buckets.at(-1) ?? fallback;
+}
 
 // ─── Worker Export ───────────────────────────────────────────────────────────
 
@@ -105,8 +133,21 @@ export default {
         return forbidden(request, "Token not authorized for this tenant");
       }
 
-      const days = safeInt(url.searchParams.get("days"), 30, 1, 90);
-      const limit = safeInt(url.searchParams.get("limit"), 20, 1, 100);
+      if (QUERY_PATHS.has(pathname)) {
+        const limited = await applyQueryRateLimit(request, env, tenantId!);
+        if (limited) return limited;
+      }
+
+      const days = canonicalQueryBucket(
+        url.searchParams.get("days"),
+        QUERY_DAY_BUCKETS,
+        30,
+      );
+      const limit = canonicalQueryBucket(
+        url.searchParams.get("limit"),
+        QUERY_LIMIT_BUCKETS,
+        20,
+      );
 
       switch (pathname) {
         case "/api/overview":
@@ -183,7 +224,8 @@ async function handleCollect(
   env: Env,
 ): Promise<Response> {
   // Authenticated server-to-server ingest skips the public collect limiter.
-  if (!(await verifyIngestAuth(request, env))) {
+  const ingestAuthenticated = await verifyIngestAuth(request, env);
+  if (!ingestAuthenticated) {
     const limited = await applyCollectRateLimit(request, env);
     if (limited) return limited;
   }
@@ -209,6 +251,21 @@ async function handleCollect(
     );
   }
 
+  const serverToServer = Boolean(
+    ingestAuthenticated && body.tid && SAFE_TENANT_ID.test(body.tid),
+  );
+  // A valid token by itself is not a server-to-server event. Malformed or
+  // browser-shaped payloads still consume the public quotas so they cannot use
+  // an Authorization header to bypass the KV/ingest cost controls.
+  if (ingestAuthenticated && !serverToServer) {
+    const limited = await applyCollectRateLimit(request, env);
+    if (limited) return limited;
+  }
+  if (!serverToServer) {
+    const limited = await applySiteCollectRateLimit(request, env, body.sid);
+    if (limited) return limited;
+  }
+
   // resolveTenant reads KV (which can fail transiently) and trackEvent runs the
   // hash + write; wrap both so a throw returns a CORS-bearing 500 rather than
   // escaping fetch() as a bare 500 with no Access-Control-Allow-Origin header.
@@ -218,6 +275,7 @@ async function handleCollect(
       request,
       env,
       body,
+      { ingestAuthenticated },
     );
     if (!tenantId) {
       return publicJsonResponse(
@@ -288,7 +346,27 @@ async function applyCollectRateLimit(
   env: Env,
 ): Promise<Response | null> {
   const limiter = env.COLLECT_RATE_LIMIT;
-  if (!limiter || typeof limiter.limit !== "function") return null;
+  if (!limiter || typeof limiter.limit !== "function") {
+    if (env.ENVIRONMENT === "development") {
+      console.warn(
+        JSON.stringify({
+          event: "collect_rate_limit_unavailable",
+          environment: env.ENVIRONMENT,
+        }),
+      );
+      return null;
+    }
+    console.error(
+      JSON.stringify({
+        event: "collect_rate_limit_unavailable",
+        environment: env.ENVIRONMENT,
+      }),
+    );
+    return publicJsonResponse(
+      { error: "Analytics temporarily unavailable" },
+      503,
+    );
+  }
 
   try {
     const ip = request.headers.get("CF-Connecting-IP")?.trim() || "unknown";
@@ -297,10 +375,141 @@ async function applyCollectRateLimit(
       return publicJsonResponse({ error: "Too many requests" }, 429);
     }
   } catch (error) {
-    // Fail open: a binding/runtime error must not drop browser collect.
-    console.error("[Collect] Rate limit check failed:", error);
+    console.error(
+      JSON.stringify({
+        event: "collect_rate_limit_failed",
+        environment: env.ENVIRONMENT,
+        error: error instanceof Error ? error.message.slice(0, 200) : "unknown",
+      }),
+    );
+    if (env.ENVIRONMENT !== "development") {
+      return publicJsonResponse(
+        { error: "Analytics temporarily unavailable" },
+        503,
+      );
+    }
   }
   return null;
+}
+
+async function applySiteCollectRateLimit(
+  request: Request,
+  env: Env,
+  siteId: string | undefined,
+): Promise<Response | null> {
+  const normalizedSiteId =
+    siteId && SAFE_TENANT_ID.test(siteId) ? siteId : "invalid";
+  const origin =
+    extractHostname(request.headers.get("Origin")) ??
+    extractHostname(request.headers.get("Referer")) ??
+    "unknown";
+  return applyPublicRateLimit(
+    env.SITE_COLLECT_RATE_LIMIT,
+    [`site:${normalizedSiteId}`, `origin:${origin.toLowerCase()}`],
+    env,
+    "site_collect_rate_limit",
+  );
+}
+
+async function applyQueryRateLimit(
+  request: Request,
+  env: Env,
+  tenantId: string,
+): Promise<Response | null> {
+  const authorization = request.headers.get("Authorization") ?? "";
+  const tokenSubject = authorization.startsWith("Bearer ")
+    ? authorization.slice("Bearer ".length).trim()
+    : authorization.trim();
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(tokenSubject),
+  );
+  const tokenHash = Array.from(new Uint8Array(digest).slice(0, 16), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  const limiter = env.QUERY_RATE_LIMIT;
+  if (!limiter || typeof limiter.limit !== "function") {
+    return rateLimitUnavailable(request, env, "query_rate_limit");
+  }
+
+  try {
+    const results = await Promise.all([
+      limiter.limit({ key: `token:${tokenHash}` }),
+      limiter.limit({ key: `tenant:${tenantId}:token:${tokenHash}` }),
+    ]);
+    if (results.some(({ success }) => !success)) {
+      return privateJsonResponse(request, { error: "Too many requests" }, 429);
+    }
+  } catch (error) {
+    logRateLimitFailure(env, "query_rate_limit", error);
+    if (env.ENVIRONMENT !== "development") {
+      return privateJsonResponse(
+        request,
+        { error: "Analytics temporarily unavailable" },
+        503,
+      );
+    }
+  }
+  return null;
+}
+
+async function applyPublicRateLimit(
+  limiter: RateLimit | undefined,
+  keys: readonly string[],
+  env: Env,
+  event: string,
+): Promise<Response | null> {
+  if (!limiter || typeof limiter.limit !== "function") {
+    return rateLimitUnavailable(undefined, env, event);
+  }
+
+  try {
+    const results = await Promise.all(
+      keys.map((key) => limiter.limit({ key })),
+    );
+    if (results.some(({ success }) => !success)) {
+      return publicJsonResponse({ error: "Too many requests" }, 429);
+    }
+  } catch (error) {
+    logRateLimitFailure(env, event, error);
+    if (env.ENVIRONMENT !== "development") {
+      return publicJsonResponse(
+        { error: "Analytics temporarily unavailable" },
+        503,
+      );
+    }
+  }
+  return null;
+}
+
+function rateLimitUnavailable(
+  request: Request | undefined,
+  env: Env,
+  event: string,
+): Response | null {
+  const payload = { event: `${event}_unavailable`, environment: env.ENVIRONMENT };
+  if (env.ENVIRONMENT === "development") {
+    console.warn(JSON.stringify(payload));
+    return null;
+  }
+  console.error(JSON.stringify(payload));
+  return request
+    ? privateJsonResponse(
+        request,
+        { error: "Analytics temporarily unavailable" },
+        503,
+      )
+    : publicJsonResponse({ error: "Analytics temporarily unavailable" }, 503);
+}
+
+function logRateLimitFailure(env: Env, event: string, error: unknown): void {
+  console.error(
+    JSON.stringify({
+      event: `${event}_failed`,
+      environment: env.ENVIRONMENT,
+      error: error instanceof Error ? error.message.slice(0, 200) : "unknown",
+    }),
+  );
 }
 
 class PayloadTooLargeError extends Error {}

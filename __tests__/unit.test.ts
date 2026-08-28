@@ -3,7 +3,11 @@
 // rate limiting logic, input validation, device parsing, and referrer cleaning.
 
 import { describe, expect, it } from "bun:test";
-import worker from "../src/index.ts";
+import worker, {
+  canonicalQueryBucket,
+  QUERY_DAY_BUCKETS,
+  QUERY_LIMIT_BUCKETS,
+} from "../src/index.ts";
 import type { Env } from "../src/env.ts";
 import {
   createScopedToken,
@@ -13,8 +17,13 @@ import {
 } from "../src/lib/auth.ts";
 import { isBot } from "../src/lib/bot-filter.ts";
 import { generateVisitorHash } from "../src/lib/fingerprint.ts";
-import { escapeSql } from "../src/lib/query.ts";
-import { parseDomainList } from "../src/lib/tenant.ts";
+import { clearAnalyticsQueryCache, escapeSql } from "../src/lib/query.ts";
+import {
+  clearDomainCacheForTests,
+  getDomainCacheSizesForTests,
+  parseDomainList,
+  resolveTenant,
+} from "../src/lib/tenant.ts";
 import { cleanReferrer, parseDeviceType } from "../src/lib/ua-parser.ts";
 import { extractHostname } from "../src/lib/utils.ts";
 import { getTrackerScript } from "../src/tracker/script.ts";
@@ -297,6 +306,189 @@ describe("parseDomainList", () => {
   });
 });
 
+describe("domain allowlist cache", () => {
+  it("keeps positive entries isolated from bounded negative churn", async () => {
+    clearDomainCacheForTests();
+    const getCalls: string[] = [];
+    const env = {
+      ...createMockEnv([]),
+      DOMAINS_KV: {
+        get: async (key: string, options?: unknown) => {
+          getCalls.push(key);
+          expect(options).toEqual({ type: "text", cacheTtl: 60 });
+          return key === "domains:known_tenant"
+            ? JSON.stringify(["example.com"])
+            : null;
+        },
+      } as unknown as KVNamespace,
+    };
+
+    await resolveTenant(
+      new Request("https://analytics.example.com/api/collect", {
+        headers: { Origin: "https://example.com" },
+      }),
+      env,
+      { t: "pageview", p: "/", sid: "known_tenant" },
+    );
+
+    for (let index = 0; index < 300; index += 1) {
+      await resolveTenant(
+        new Request("https://analytics.example.com/api/collect", {
+          headers: { Origin: "https://example.com" },
+        }),
+        env,
+        { t: "pageview", p: "/", sid: `tenant_${index}` },
+      );
+    }
+
+    await resolveTenant(
+      new Request("https://analytics.example.com/api/collect", {
+        headers: { Origin: "https://example.com" },
+      }),
+      env,
+      { t: "pageview", p: "/", sid: "known_tenant" },
+    );
+
+    expect(getCalls.filter((key) => key === "domains:known_tenant")).toHaveLength(1);
+    expect(getDomainCacheSizesForTests()).toEqual({
+      positive: 1,
+      negative: 64,
+    });
+
+    const positiveEnv = {
+      ...env,
+      DOMAINS_KV: {
+        get: async () => JSON.stringify(["example.com"]),
+      } as unknown as KVNamespace,
+    };
+    for (let index = 0; index < 300; index += 1) {
+      await resolveTenant(
+        new Request("https://analytics.example.com/api/collect", {
+          headers: { Origin: "https://example.com" },
+        }),
+        positiveEnv,
+        { t: "pageview", p: "/", sid: `positive_${index}` },
+      );
+    }
+    expect(getDomainCacheSizesForTests()).toEqual({
+      positive: 256,
+      negative: 64,
+    });
+    clearDomainCacheForTests();
+  });
+});
+
+describe("query parameter buckets", () => {
+  it("collapses hostile day and limit permutations to supported cache keys", () => {
+    expect(canonicalQueryBucket("1", QUERY_DAY_BUCKETS, 30)).toBe(1);
+    expect(canonicalQueryBucket("2", QUERY_DAY_BUCKETS, 30)).toBe(7);
+    expect(canonicalQueryBucket("8", QUERY_DAY_BUCKETS, 30)).toBe(30);
+    expect(canonicalQueryBucket("31", QUERY_DAY_BUCKETS, 30)).toBe(90);
+    expect(canonicalQueryBucket("999999", QUERY_DAY_BUCKETS, 30)).toBe(90);
+    expect(canonicalQueryBucket("garbage", QUERY_DAY_BUCKETS, 30)).toBe(30);
+    expect(canonicalQueryBucket("11", QUERY_LIMIT_BUCKETS, 20)).toBe(20);
+    expect(canonicalQueryBucket("51", QUERY_LIMIT_BUCKETS, 20)).toBe(100);
+  });
+});
+
+describe("authenticated query cost guard", () => {
+  it("fails closed when the query limiter is missing or throws", async () => {
+    const originalFetch = globalThis.fetch;
+    let sqlCalls = 0;
+    globalThis.fetch = (async () => {
+      sqlCalls += 1;
+      return new Response(JSON.stringify({ data: [] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      const request = () =>
+        new Request(
+          "https://analytics.example.com/api/overview?tenant_id=tenant_1&days=30",
+          { headers: { Authorization: "Bearer admin-secret" } },
+        );
+
+      for (const environment of ["production", "staging"] as const) {
+        const missing = {
+          ...createMockEnv([]),
+          ENVIRONMENT: environment,
+          QUERY_RATE_LIMIT: undefined,
+        } as unknown as Env;
+        const throwing = {
+          ...createMockEnv([], {
+            queryRateLimit: createFakeRateLimiter({ throws: true }),
+          }),
+          ENVIRONMENT: environment,
+        };
+        expect((await worker.fetch(request(), missing)).status).toBe(503);
+        expect((await worker.fetch(request(), throwing)).status).toBe(503);
+      }
+      expect(sqlCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearAnalyticsQueryCache();
+    }
+  });
+
+  it("returns 429 before SQL when the authenticated query quota is exhausted", async () => {
+    const originalFetch = globalThis.fetch;
+    let sqlCalls = 0;
+    globalThis.fetch = (async () => {
+      sqlCalls += 1;
+      return new Response(JSON.stringify({ data: [] }));
+    }) as typeof fetch;
+    const limiter = createFakeRateLimiter({ success: false });
+    try {
+      const response = await worker.fetch(
+        new Request(
+          "https://analytics.example.com/api/pages?tenant_id=tenant_1&days=30",
+          { headers: { Authorization: "Bearer admin-secret" } },
+        ),
+        createMockEnv([], { queryRateLimit: limiter }),
+      );
+
+      expect(response.status).toBe(429);
+      expect(limiter.keys).toHaveLength(2);
+      expect(sqlCalls).toBe(0);
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearAnalyticsQueryCache();
+    }
+  });
+
+  it("collapses query permutations before Analytics Engine SQL", async () => {
+    const originalFetch = globalThis.fetch;
+    const sql: string[] = [];
+    globalThis.fetch = (async (_input, init) => {
+      sql.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify({ data: [] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const queryLimiter = createFakeRateLimiter();
+    const env = createMockEnv([], { queryRateLimit: queryLimiter });
+    const query = (search: string, token = "admin-secret") =>
+      worker.fetch(
+        new Request(
+          `https://analytics.example.com/api/overview?tenant_id=tenant_1&${search}`,
+          { headers: { Authorization: `Bearer ${token}` } },
+        ),
+        env,
+      );
+    try {
+      expect((await query("days=8&attacker=a")).status).toBe(200);
+      expect((await query("attacker=b&days=29", "admin-secret   ")).status).toBe(200);
+      expect(sql).toHaveLength(1);
+      expect(sql[0]).toContain("INTERVAL '30' DAY");
+      expect(queryLimiter.keys).toHaveLength(4);
+      expect(new Set(queryLimiter.keys).size).toBe(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearAnalyticsQueryCache();
+    }
+  });
+});
+
 // ─── Auth Guards ──────────────────────────────────────────────────────────────
 
 describe("auth guards", () => {
@@ -546,10 +738,152 @@ describe("collect endpoint", () => {
     expect(dataPoints).toHaveLength(0);
   });
 
+  it("applies site and origin quotas before tenant-domain KV resolution", async () => {
+    const siteLimiter = createFakeRateLimiter({ success: false });
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    let kvReads = 0;
+    const env = {
+      ...createMockEnv(dataPoints, { siteRateLimit: siteLimiter }),
+      DOMAINS_KV: {
+        get: async () => {
+          kvReads += 1;
+          return JSON.stringify(["example.com"]);
+        },
+      } as KVNamespace,
+    };
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          Origin: "https://example.com",
+          "User-Agent": browserUa,
+          "CF-Connecting-IP": "203.0.113.60",
+        },
+        body: JSON.stringify({ t: "pageview", p: "/", sid: "tenant_quota" }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(429);
+    expect(siteLimiter.keys).toEqual([
+      "site:tenant_quota",
+      "origin:example.com",
+    ]);
+    expect(kvReads).toBe(0);
+    expect(dataPoints).toHaveLength(0);
+  });
+
+  it("fails closed when either production or sandbox collect limiter is missing", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const request = () =>
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: { Origin: "https://example.com", "User-Agent": browserUa },
+        body: JSON.stringify({ t: "pageview", p: "/", sid: "tenant_1" }),
+      });
+
+    for (const environment of ["production", "staging"] as const) {
+      const withoutIp = {
+        ...createMockEnv(dataPoints),
+        ENVIRONMENT: environment,
+        COLLECT_RATE_LIMIT: undefined,
+      } as unknown as Env;
+      const withoutSite = {
+        ...createMockEnv(dataPoints),
+        ENVIRONMENT: environment,
+        SITE_COLLECT_RATE_LIMIT: undefined,
+      } as unknown as Env;
+      expect((await worker.fetch(request(), withoutIp)).status).toBe(503);
+      expect((await worker.fetch(request(), withoutSite)).status).toBe(503);
+    }
+    expect(dataPoints).toHaveLength(0);
+  });
+
+  it("fails closed when the production or sandbox rate-limit binding throws", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    for (const environment of ["production", "staging"] as const) {
+      const env = {
+        ...createMockEnv(dataPoints, {
+          rateLimit: createFakeRateLimiter({ throws: true }),
+        }),
+        ENVIRONMENT: environment,
+      };
+      const response = await worker.fetch(
+        new Request("https://analytics.example.com/api/collect", {
+          method: "POST",
+          headers: {
+            Origin: "https://example.com",
+            "User-Agent": browserUa,
+          },
+          body: JSON.stringify({ t: "pageview", p: "/", sid: "tenant_1" }),
+        }),
+        env,
+      );
+
+      expect(response.status).toBe(503);
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    }
+    expect(dataPoints).toHaveLength(0);
+  });
+
+  it("fails closed when the production or sandbox site limiter throws", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    for (const environment of ["production", "staging"] as const) {
+      const env = {
+        ...createMockEnv(dataPoints, {
+          siteRateLimit: createFakeRateLimiter({ throws: true }),
+        }),
+        ENVIRONMENT: environment,
+      };
+      const response = await worker.fetch(
+        new Request("https://analytics.example.com/api/collect", {
+          method: "POST",
+          headers: { Origin: "https://example.com", "User-Agent": browserUa },
+          body: JSON.stringify({ t: "pageview", p: "/", sid: "tenant_1" }),
+        }),
+        env,
+      );
+
+      expect(response.status).toBe(503);
+      expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    }
+    expect(dataPoints).toHaveLength(0);
+  });
+
+  it("allows controlled local development when the rate limiter is unavailable", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = {
+      ...createMockEnv(dataPoints, {
+        rateLimit: createFakeRateLimiter({ throws: true }),
+      }),
+      ENVIRONMENT: "development",
+    };
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          Origin: "https://example.com",
+          "User-Agent": browserUa,
+        },
+        body: JSON.stringify({ t: "pageview", p: "/", sid: "tenant_dev" }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(204);
+    expect(dataPoints).toHaveLength(1);
+  });
+
   it("skips the collect rate limit for authenticated server-to-server ingest", async () => {
     const limiter = createFakeRateLimiter({ success: false });
+    const siteLimiter = createFakeRateLimiter({ success: false });
     const dataPoints: AnalyticsEngineDataPoint[] = [];
-    const env = createMockEnv(dataPoints, { rateLimit: limiter });
+    const env = createMockEnv(dataPoints, {
+      rateLimit: limiter,
+      siteRateLimit: siteLimiter,
+    });
 
     const response = await worker.fetch(
       new Request("https://analytics.example.com/api/collect", {
@@ -572,7 +906,41 @@ describe("collect endpoint", () => {
 
     expect(response.status).toBe(204);
     expect(limiter.keys).toHaveLength(0);
+    expect(siteLimiter.keys).toHaveLength(0);
     expect(dataPoints).toHaveLength(1);
+  });
+
+  it("does not treat a Bearer header without a valid tid as server-to-server ingest", async () => {
+    const limiter = createFakeRateLimiter({ success: false });
+    const siteLimiter = createFakeRateLimiter({ success: false });
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints, {
+      rateLimit: limiter,
+      siteRateLimit: siteLimiter,
+    });
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer ingest-secret",
+          Origin: "https://example.com",
+          "User-Agent": browserUa,
+          "CF-Connecting-IP": "203.0.113.51",
+        },
+        body: JSON.stringify({
+          t: "pageview",
+          p: "/",
+          sid: "tenant_1",
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(429);
+    expect(limiter.keys).toEqual(["203.0.113.51"]);
+    expect(siteLimiter.keys).toHaveLength(0);
+    expect(dataPoints).toHaveLength(0);
   });
 });
 
@@ -646,6 +1014,8 @@ interface MockEnvOptions {
   domains?: string[] | null;
   allowUnregistered?: string;
   rateLimit?: FakeRateLimiter;
+  siteRateLimit?: FakeRateLimiter;
+  queryRateLimit?: FakeRateLimiter;
 }
 
 interface FakeRateLimiter extends RateLimit {
@@ -653,13 +1023,14 @@ interface FakeRateLimiter extends RateLimit {
 }
 
 function createFakeRateLimiter(
-  opts: { success?: boolean } = {},
+  opts: { success?: boolean; throws?: boolean } = {},
 ): FakeRateLimiter {
   const keys: string[] = [];
   return {
     keys,
     async limit({ key }: RateLimitOptions) {
       keys.push(key);
+      if (opts.throws) throw new Error("rate limiter unavailable");
       return { success: opts.success ?? true };
     },
   };
@@ -683,6 +1054,9 @@ function createMockEnv(
     },
     DOMAINS_KV: domainsKv,
     COLLECT_RATE_LIMIT: opts.rateLimit ?? createFakeRateLimiter(),
+    SITE_COLLECT_RATE_LIMIT:
+      opts.siteRateLimit ?? createFakeRateLimiter(),
+    QUERY_RATE_LIMIT: opts.queryRateLimit ?? createFakeRateLimiter(),
     AUTH_TOKEN: "admin-secret",
     CF_API_TOKEN: "cf-secret",
     FINGERPRINT_SECRET: "fingerprint-secret",

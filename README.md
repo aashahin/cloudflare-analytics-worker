@@ -155,13 +155,21 @@ Query routes require `Authorization: Bearer <token>` and `?tenant_id=`.
 
 | Method | Path             | Query Params                        | Description                             |
 | ------ | ---------------- | ----------------------------------- | --------------------------------------- |
-| `GET`  | `/api/overview`  | `days` (1-90, default 30)           | Totals, avg time-on-page, top pages     |
-| `GET`  | `/api/pages`     | `days`, `limit` (1-100, default 20) | Top pages by views                      |
+| `GET`  | `/api/overview`  | `days` (1/7/30/90, default 30)      | Totals and average time-on-page         |
+| `GET`  | `/api/pages`     | `days`, `limit` (10/20/50/100)      | Top pages by views                      |
 | `GET`  | `/api/referrers` | `days`, `limit`                     | Top referrer domains plus UTM data      |
 | `GET`  | `/api/geo`       | `days`                              | Country and city breakdown              |
 | `GET`  | `/api/devices`   | `days`                              | Desktop / Mobile / Tablet breakdown     |
 | `GET`  | `/api/realtime`  | —                                   | Visitors active in the last 30 minutes  |
 | `GET`  | `/api/events`    | `days`, `limit`                     | Custom event totals and unique daily visitors |
+| `GET`  | `/api/sections`  | `days`, `limit`                     | Cached dashboard section bundle         |
+
+Positive numeric values between supported buckets round up to the next bucket;
+invalid values use the documented default. This deliberately bounds query-cache
+cardinality. Query routes are also limited to 60 requests/minute per Cloudflare
+location, both per token and per tenant-and-token pair, preventing an admin
+token from evading the bound with random tenant IDs. They fail closed outside
+local development when the binding is unavailable.
 
 ### Admin API
 
@@ -201,14 +209,17 @@ Tenant resolution priority on collect:
 
 `wrangler.toml` defaults to `ENVIRONMENT=production` so deployments enforce the KV domain allowlist unless you explicitly override it for local development.
 
-> **Trust model for browser collection.** Like every client-side beacon endpoint (GA, Plausible, Fathom), `/api/collect` is unauthenticated and the `Origin`/`Referer` allowlist is only a best-effort filter — a non-browser client can spoof those headers, and the `sid` is public (it ships in `/tracker.js`). Treat browser-submitted analytics as best-effort, not tamper-proof; use the server-to-server `tid` + Bearer path for trusted data. Configure a **Cloudflare Rate Limiting rule** on `/api/collect` in production to bound abuse/cost, and never leave `ALLOW_UNREGISTERED_DOMAINS="true"` enabled outside a short onboarding window (it disables origin checks entirely).
+> **Trust model for browser collection.** Like every client-side beacon endpoint (GA, Plausible, Fathom), `/api/collect` is unauthenticated and the `Origin`/`Referer` allowlist is only a best-effort filter — a non-browser client can spoof those headers, and the `sid` is public (it ships in `/tracker.js`). Treat browser-submitted analytics as best-effort, not tamper-proof; use the server-to-server `tid` + Bearer path for trusted data. Per Cloudflare location, the Worker enforces 120 events/minute per IP (60 complete pageview+beacon lifecycles) and 1,200 events/minute per site and origin before domain KV resolution. Never leave `ALLOW_UNREGISTERED_DOMAINS="true"` enabled outside a short onboarding window (it disables origin checks entirely).
 
 ## Cloudflare Bindings
 
-| Binding      | Type             | Purpose                              |
-| ------------ | ---------------- | ------------------------------------ |
-| `ANALYTICS`  | Analytics Engine | Event storage via `writeDataPoint()` |
-| `DOMAINS_KV` | KV               | Per-tenant domain allowlist          |
+| Binding                  | Type             | Purpose                                      |
+| ------------------------ | ---------------- | -------------------------------------------- |
+| `ANALYTICS`              | Analytics Engine | Event storage via `writeDataPoint()`         |
+| `DOMAINS_KV`             | KV               | Per-tenant domain allowlist                  |
+| `COLLECT_RATE_LIMIT`     | Rate Limit       | Public collect quota per client IP           |
+| `SITE_COLLECT_RATE_LIMIT` | Rate Limit      | Site and origin quota before KV lookup       |
+| `QUERY_RATE_LIMIT`       | Rate Limit       | Authenticated reads per tenant/token subject |
 
 ## Environment
 
@@ -219,5 +230,5 @@ Tenant resolution priority on collect:
 | `FINGERPRINT_SECRET`         | Secret | Dedicated secret for privacy-safe visitor hashing            |
 | `INGEST_TOKEN`               | Secret | Optional separate token for server-to-server ingestion       |
 | `ACCOUNT_ID`                 | Var    | Cloudflare account ID                                        |
-| `ENVIRONMENT`                | Var    | `development` or `production`                                |
+| `ENVIRONMENT`                | Var    | `development`, `staging`, or `production`                     |
 | `ALLOW_UNREGISTERED_DOMAINS` | Var    | Optional `"true"` grace period for unregistered site domains |

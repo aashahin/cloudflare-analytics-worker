@@ -10,10 +10,17 @@ export interface Env {
 
   /**
    * Workers Rate Limit binding (`[[ratelimits]]` in wrangler.toml).
-   * POST /api/collect is limited to 60 requests / 60s per CF-Connecting-IP.
+   * POST /api/collect is limited to 120 requests / 60s per CF-Connecting-IP
+   * and Cloudflare location, enough for 60 complete pageview+beacon lifecycles.
    * Authenticated server-to-server ingest skips this limiter.
    */
   COLLECT_RATE_LIMIT: RateLimit;
+
+  /** Per-location browser quota keyed by site and origin before domain KV reads. */
+  SITE_COLLECT_RATE_LIMIT: RateLimit;
+
+  /** Per-location query quota keyed by tenant and a hash of the bearer token. */
+  QUERY_RATE_LIMIT: RateLimit;
 
   // Secrets (set via `wrangler secret put`)
   AUTH_TOKEN: string;

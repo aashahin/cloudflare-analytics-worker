@@ -2,9 +2,10 @@
 // Queries the Cloudflare Analytics Engine SQL API from within the Worker.
 // All queries are scoped to a single tenant via blob1 = tenant_id.
 //
-// AE SQL is billed per query ($1 / million). Overview / realtime / sections
-// go through a colo Cache API (30s) plus an isolate Map L1 so dashboard polls
-// do not re-bill. Pattern matches apps/backend/src/worker/audit/analytics-sql.ts.
+// Every SQL API POST is a read query. Analytics Engine is not currently billed,
+// but Cloudflare publishes future read-query pricing, so overview / realtime /
+// sections go through a colo Cache API (60s) plus an isolate Map L1 to keep the
+// request count bounded. Pattern matches backend audit analytics SQL caching.
 
 import type { Env } from "@/env.ts";
 import type {
@@ -56,13 +57,15 @@ function validateTenantId(tenantId: string): void {
 
 // ─── Cache (isolate L1 + Workers Cache API) ──────────────────────────────────
 
-const QUERY_CACHE_TTL_SECONDS = 30;
+const QUERY_CACHE_TTL_SECONDS = 60;
 const QUERY_CACHE_TTL_MS = QUERY_CACHE_TTL_SECONDS * 1000;
 const QUERY_CACHE_L1_MAX = 50;
+const QUERY_INFLIGHT_MAX = 100;
 const CACHE_NAMESPACE = "analytics-query-v1";
 const CACHE_ORIGIN = "https://analytics-query.manhali.internal/v1/";
 
 const queryL1 = new Map<string, { expiresAt: number; value: unknown }>();
+const queryInflight = new Map<string, Promise<unknown>>();
 let cacheHandle: Promise<Cache> | undefined;
 
 function queryCacheHandle(): Promise<Cache> | undefined {
@@ -142,24 +145,44 @@ async function withCachedResult<T>(
   if (hit && hit.expiresAt > Date.now()) {
     return hit.value as T;
   }
+  if (hit) queryL1.delete(key);
 
-  const cached = await cacheApiGet<T>(key);
-  if (cached !== undefined) {
-    rememberL1(key, cached);
-    return cached;
-  }
+  const existing = queryInflight.get(key);
+  if (existing) return existing as Promise<T>;
 
-  const value = await load();
-  if (shouldStore(value)) {
-    rememberL1(key, value);
-    await cacheApiPut(key, value);
+  const resolve = async (): Promise<T> => {
+    const cached = await cacheApiGet<T>(key);
+    if (cached !== undefined) {
+      rememberL1(key, cached);
+      return cached;
+    }
+
+    const value = await load();
+    if (shouldStore(value)) {
+      rememberL1(key, value);
+      await cacheApiPut(key, value);
+    }
+    return value;
+  };
+
+  // Bound coordination state so attacker-controlled tenant/window keys cannot
+  // grow the isolate indefinitely. At saturation, correctness is preserved;
+  // only the coalescing optimization is skipped for the new key.
+  if (queryInflight.size >= QUERY_INFLIGHT_MAX) return resolve();
+
+  const pending = resolve();
+  queryInflight.set(key, pending);
+  try {
+    return await pending;
+  } finally {
+    if (queryInflight.get(key) === pending) queryInflight.delete(key);
   }
-  return value;
 }
 
 /** Drop isolate L1 (Cache API entries expire via max-age). */
 export function clearAnalyticsQueryCache(): void {
   queryL1.clear();
+  queryInflight.clear();
   cacheHandle = undefined;
 }
 
@@ -224,12 +247,14 @@ export async function getOverview(
     `overview:${dataset}:${tenantId}:${days}`,
     async () => {
       // ClickHouse-style AE SQL: one scan for pageview totals + beacon duration.
-      // `if()` is documented; AVG skips NULL so beacon-only duration is isolated.
+      // Duration uses the documented sampling weight on both numerator and
+      // denominator; AVG(double2) would bias rows with different intervals.
       const sql = `
     SELECT
       SUM(if(blob11 = 'pageview', _sample_interval, 0)) AS total_views,
       COUNT(DISTINCT if(blob11 = 'pageview', blob3, NULL)) AS unique_visitors,
-      AVG(if(blob11 = 'beacon', double2, NULL)) AS avg_time_on_page
+      SUM(if(blob11 = 'beacon', double2 * _sample_interval, 0)) /
+        SUM(if(blob11 = 'beacon', _sample_interval, 0)) AS avg_time_on_page
     FROM ${dataset}
     WHERE blob1 = '${escapeSql(tenantId)}'
       AND (blob11 = 'pageview' OR blob11 = 'beacon')
@@ -502,7 +527,7 @@ export type DashboardSections = {
 
 /**
  * One dashboard round-trip instead of five public HTTP calls from the
- * platform Worker. Cached 30s (isolate L1 + Cache API) so tab reloads and
+ * platform Worker. Cached 60s (isolate L1 + Cache API) so tab reloads and
  * fetcher retries do not re-bill Analytics Engine SQL.
  */
 export async function getDashboardSections(

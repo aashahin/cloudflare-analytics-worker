@@ -76,6 +76,16 @@ function createQueryEnv(dataset?: string): Env {
         return { success: true };
       },
     },
+    SITE_COLLECT_RATE_LIMIT: {
+      async limit() {
+        return { success: true };
+      },
+    },
+    QUERY_RATE_LIMIT: {
+      async limit() {
+        return { success: true };
+      },
+    },
     AUTH_TOKEN: "admin-secret",
     CF_API_TOKEN: "cf-secret",
     FINGERPRINT_SECRET: "fingerprint-secret",
@@ -195,11 +205,24 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
     expect(production).toMatch(/\[observability\.logs\][\s\S]*?head_sampling_rate\s*=\s*0\.05/);
     expect(production).toMatch(/invocation_logs\s*=\s*false/);
     expect(production).toMatch(/name\s*=\s*"COLLECT_RATE_LIMIT"/);
-    expect(production).toMatch(/namespace_id\s*=\s*"1001"/);
-    expect(production).toMatch(/simple\s*=\s*\{\s*limit\s*=\s*60,\s*period\s*=\s*60\s*\}/);
+    expect(production).toMatch(/namespace_id\s*=\s*"1101"/);
+    expect(production).toMatch(/simple\s*=\s*\{\s*limit\s*=\s*120,\s*period\s*=\s*60\s*\}/);
+    expect(production).toMatch(/name\s*=\s*"SITE_COLLECT_RATE_LIMIT"/);
+    expect(production).toMatch(/namespace_id\s*=\s*"1102"/);
+    expect(production).toMatch(/name\s*=\s*"QUERY_RATE_LIMIT"/);
+    expect(production).toMatch(/namespace_id\s*=\s*"1103"/);
     expect(sandbox).toMatch(/head_sampling_rate\s*=\s*0\.1/);
     expect(sandbox).toMatch(/\[env\.sandbox\.observability\.logs\][\s\S]*?head_sampling_rate\s*=\s*0\.1/);
+    expect(sandbox).toMatch(/invocation_logs\s*=\s*false/);
     expect(sandbox).toMatch(/name\s*=\s*"COLLECT_RATE_LIMIT"/);
+    expect(sandbox).toMatch(/namespace_id\s*=\s*"2101"/);
+    expect(sandbox).toMatch(/name\s*=\s*"SITE_COLLECT_RATE_LIMIT"/);
+    expect(sandbox).toMatch(/namespace_id\s*=\s*"2102"/);
+    expect(sandbox).toMatch(/name\s*=\s*"QUERY_RATE_LIMIT"/);
+    expect(sandbox).toMatch(/namespace_id\s*=\s*"2103"/);
+    expect(production).toMatch(/\[limits\][\s\S]*?cpu_ms\s*=\s*500/);
+    expect(sandbox).toMatch(/\[env\.sandbox\.limits\]/);
+    expect(sandbox).not.toMatch(/cpu_ms\s*=/);
   });
 
   it("query.ts does not hardcode FROM manhali_analytics in SQL strings", () => {
@@ -244,8 +267,42 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
     expect(captured.sql).toHaveLength(1);
     expect(captured.sql[0]).toMatch(/unique_visitors/);
     expect(captured.sql[0]).toMatch(/avg_time_on_page/);
+    expect(captured.sql[0]).toMatch(
+      /SUM\(if\(blob11 = 'beacon', double2 \* _sample_interval, 0\)\)\s*\/\s*SUM\(if\(blob11 = 'beacon', _sample_interval, 0\)\)/,
+    );
+    expect(captured.sql[0]).not.toMatch(/AVG\(if\(blob11 = 'beacon'/);
     expect(captured.sql[0]).not.toMatch(/GROUP BY page_path/);
     expect(overview.topPages).toEqual([]);
+  });
+
+  it("coalesces concurrent cold queries for the same tenant window", async () => {
+    const env = createQueryEnv(SANDBOX_DATASET);
+    let release!: () => void;
+    let markStarted!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const sql: string[] = [];
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      sql.push(String(init?.body ?? ""));
+      markStarted();
+      await gate;
+      return emptyEngineResponse();
+    }) as typeof fetch;
+
+    const first = getOverview(env, "tenant_coalesced", 7);
+    const second = getOverview(env, "tenant_coalesced", 7);
+    await started;
+    try {
+      expect(sql).toHaveLength(1);
+    } finally {
+      release();
+    }
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+    expect(sql).toHaveLength(1);
   });
 
   it("Cache API serves a second overview after isolate L1 is cleared", async () => {

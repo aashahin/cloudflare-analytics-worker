@@ -8,6 +8,9 @@ preview_urls = false
 compatibility_date = "2026-05-29"
 compatibility_flags = ["nodejs_compat"]
 
+[limits]
+cpu_ms = 500
+
 [[rules]]
 type = "ESModule"
 globs = ["**/*.js"]
@@ -27,12 +30,26 @@ custom_domain = true
 # is no scheduled rollup/cleanup work. The worker exports only fetch(); a cron
 # trigger with no scheduled() handler would fire daily with nothing to run.
 #
-# POST /api/collect is rate-limited in-worker (60/min per CF-Connecting-IP).
-# Authenticated server-to-server ingest skips the limiter.
+# A normal page lifecycle emits a pageview and one beacon. The IP quota allows
+# 60 complete lifecycles/minute per Cloudflare location from a shared client
+# while remaining a strong abuse bound. Site/origin quota runs before domain KV
+# resolution and caps a hot tenant/origin at 600 complete lifecycles/minute per
+# location. Authenticated ingest skips both public limits. Query reads have
+# their own tenant+token quota. Namespace IDs are unique across environments.
 
 [[ratelimits]]
 name = "COLLECT_RATE_LIMIT"
-namespace_id = "1001"
+namespace_id = "1101"
+simple = { limit = 120, period = 60 }
+
+[[ratelimits]]
+name = "SITE_COLLECT_RATE_LIMIT"
+namespace_id = "1102"
+simple = { limit = 1200, period = 60 }
+
+[[ratelimits]]
+name = "QUERY_RATE_LIMIT"
+namespace_id = "1103"
 simple = { limit = 60, period = 60 }
 
 [observability]
@@ -83,6 +100,10 @@ preview_urls = true
 # No manhali.com custom domain on the sandbox account (routes not inherited when empty).
 routes = []
 
+[env.sandbox.limits]
+# The Sandbox account uses Workers Free, which rejects any explicit CPU limit.
+# Keep this empty to override the inheritable paid-production limit above.
+
 [[env.sandbox.analytics_engine_datasets]]
 binding = "ANALYTICS"
 dataset = "manhali_analytics_sandbox"
@@ -99,7 +120,17 @@ ANALYTICS_DATASET = "manhali_analytics_sandbox"
 
 [[env.sandbox.ratelimits]]
 name = "COLLECT_RATE_LIMIT"
-namespace_id = "1001"
+namespace_id = "2101"
+simple = { limit = 120, period = 60 }
+
+[[env.sandbox.ratelimits]]
+name = "SITE_COLLECT_RATE_LIMIT"
+namespace_id = "2102"
+simple = { limit = 1200, period = 60 }
+
+[[env.sandbox.ratelimits]]
+name = "QUERY_RATE_LIMIT"
+namespace_id = "2103"
 simple = { limit = 60, period = 60 }
 
 [env.sandbox.observability]
