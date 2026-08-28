@@ -23,6 +23,22 @@ import { SAFE_TENANT_ID } from "@/lib/utils.ts";
 const DEFAULT_ANALYTICS_DATASET = "manhali_analytics";
 const SAFE_ANALYTICS_DATASET = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+/**
+ * An allowlisted representation of an Analytics Engine SQL API error.
+ * Never retain the response body, request headers, bearer token, or SQL text.
+ */
+export class AnalyticsEngineQueryError extends Error {
+  readonly status: number;
+  readonly rayId: string | null;
+
+  constructor(status: number, rayId: string | null) {
+    super(`Analytics Engine query failed with HTTP ${status}`);
+    this.name = "AnalyticsEngineQueryError";
+    this.status = status;
+    this.rayId = rayId;
+  }
+}
+
 /** Resolve the AE SQL table name. Production default is manhali_analytics. */
 export function resolveAnalyticsDataset(env: Env): string {
   const raw = env.ANALYTICS_DATASET?.trim();
@@ -207,9 +223,16 @@ async function fetchAnalyticsEngine(
   });
 
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(
-      `Analytics Engine query failed (${response.status}): ${text}`,
+    // Provider bodies are intentionally neither retained nor logged: an
+    // upstream may echo SQL, tenant data, or credentials under an unknown key.
+    try {
+      await response.body?.cancel();
+    } catch {
+      // Error classification must not be replaced by a body-disposal failure.
+    }
+    throw new AnalyticsEngineQueryError(
+      response.status,
+      response.headers.get("cf-ray"),
     );
   }
 
@@ -457,10 +480,11 @@ export async function getRealtime(
     LIMIT 10
   `;
 
-    const [totalResult, pagesResult] = await Promise.all([
-      queryAnalyticsEngine(env, totalSql),
-      queryAnalyticsEngine(env, pagesSql),
-    ]);
+    // Keep the exact two-query contract, but do not burst both SQL API calls at
+    // once. Analytics Engine may transiently reject concurrent cold queries;
+    // sequencing adds no retry or fan-out and preserves exact visitor counts.
+    const totalResult = await queryAnalyticsEngine(env, totalSql);
+    const pagesResult = await queryAnalyticsEngine(env, pagesSql);
 
     return {
       currentVisitors: Number(totalResult.data[0]?.current_visitors ?? 0),

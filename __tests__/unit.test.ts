@@ -392,6 +392,56 @@ describe("query parameter buckets", () => {
 });
 
 describe("authenticated query cost guard", () => {
+  it("logs allowlisted Analytics Engine failure metadata without retaining the upstream body", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalConsoleError = console.error;
+    const logged: unknown[][] = [];
+    globalThis.fetch = (async () =>
+      new Response(
+        `{"token":"secret-value","error":"${"x".repeat(800)}"}`,
+        {
+          status: 503,
+          headers: {
+            "content-type": "application/json",
+            "cf-ray": "test-upstream-ray",
+          },
+        },
+      )) as typeof fetch;
+    console.error = (...args: unknown[]) => {
+      logged.push(args);
+    };
+
+    try {
+      const response = await worker.fetch(
+        new Request(
+          "https://analytics.example.com/api/realtime?tenant_id=tenant_1",
+          { headers: { Authorization: "Bearer admin-secret" } },
+        ),
+        createMockEnv([]),
+      );
+
+      expect(response.status).toBe(500);
+      expect(logged).toHaveLength(1);
+      expect(logged[0]).toHaveLength(1);
+      const record = JSON.parse(String(logged[0]?.[0]));
+      expect(record).toMatchObject({
+        event: "analytics_api_request_failed",
+        path: "/api/realtime",
+        errorName: "AnalyticsEngineQueryError",
+        upstream: "analytics_engine_sql_api",
+        upstreamStatus: 503,
+        upstreamRayId: "test-upstream-ray",
+      });
+      expect(record).not.toHaveProperty("upstreamBody");
+      expect(JSON.stringify(logged)).not.toContain("secret-value");
+      expect(JSON.stringify(logged)).not.toContain("cf-secret");
+    } finally {
+      globalThis.fetch = originalFetch;
+      console.error = originalConsoleError;
+      clearAnalyticsQueryCache();
+    }
+  });
+
   it("fails closed when the query limiter is missing or throws", async () => {
     const originalFetch = globalThis.fetch;
     let sqlCalls = 0;

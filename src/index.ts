@@ -19,6 +19,7 @@ import {
 } from "@/lib/cors.ts";
 import { trackEvents, type IngestOptions } from "@/lib/ingest.ts";
 import {
+  AnalyticsEngineQueryError,
   getCustomEvents,
   getDashboardSections,
   getDeviceBreakdown,
@@ -203,7 +204,7 @@ export default {
           return privateJsonResponse(request, { error: "Not Found" }, 404);
       }
     } catch (error) {
-      console.error(`[API] Error on ${pathname}:`, error);
+      logApiError(pathname, error);
       return privateJsonResponse(
         request,
         {
@@ -217,6 +218,36 @@ export default {
     }
   },
 };
+
+function logApiError(pathname: string, error: unknown): void {
+  const common = {
+    event: "analytics_api_request_failed",
+    path: pathname,
+    errorName: error instanceof Error ? error.name : "UnknownError",
+  };
+
+  if (error instanceof AnalyticsEngineQueryError) {
+    console.error(
+      JSON.stringify({
+        ...common,
+        upstream: "analytics_engine_sql_api",
+        upstreamStatus: error.status,
+        upstreamRayId: error.rayId,
+      }),
+    );
+    return;
+  }
+
+  console.error(
+    JSON.stringify({
+      ...common,
+      error:
+        error instanceof Error
+          ? error.message.slice(0, 512)
+          : String(error).slice(0, 512),
+    }),
+  );
+}
 
 // ─── Collect Handler ─────────────────────────────────────────────────────────
 

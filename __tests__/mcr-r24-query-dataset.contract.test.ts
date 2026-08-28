@@ -154,6 +154,57 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
     }
   });
 
+  it("does not overlap the two realtime Analytics Engine SQL requests", async () => {
+    const env = createQueryEnv(SANDBOX_DATASET);
+    let active = 0;
+    let maxActive = 0;
+    let calls = 0;
+
+    globalThis.fetch = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      calls += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      const sql = String(init?.body ?? "");
+
+      // Model the transient upstream rejection observed when cold realtime
+      // queries overlap. The production fix must avoid the overlap, not retry.
+      await Promise.resolve();
+      const overloaded = active > 1;
+      active -= 1;
+      if (overloaded) {
+        return new Response("too many concurrent analytics queries", {
+          status: 429,
+          headers: { "cf-ray": "test-ray" },
+        });
+      }
+
+      const data = sql.includes("AS current_visitors")
+        ? [{ current_visitors: "3" }]
+        : [{ page_path: "/courses", visitors: "2" }];
+      return new Response(
+        JSON.stringify({
+          data,
+          rows: data.length,
+          rows_before_limit_at_least: 0,
+          meta: [],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const result = await getRealtime(env, "tenant_realtime_sequential");
+
+    expect(calls).toBe(2);
+    expect(maxActive).toBe(1);
+    expect(result).toEqual({
+      currentVisitors: 3,
+      topPages: [{ pagePath: "/courses", visitors: 2 }],
+    });
+  });
+
   it("production default stays manhali_analytics when ANALYTICS_DATASET is unset", async () => {
     const env = createQueryEnv();
     const captured = captureSql(env);
