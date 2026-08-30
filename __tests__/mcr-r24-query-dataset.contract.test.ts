@@ -316,10 +316,10 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
 
     captured.restore();
     expect(captured.sql).toHaveLength(1);
-    expect(captured.sql[0]).toMatch(/unique_visitors/);
+    expect(captured.sql[0]).toMatch(/COUNT\(DISTINCT blob3\) AS unique_visitors/);
     expect(captured.sql[0]).toMatch(/avg_time_on_page/);
     expect(captured.sql[0]).toMatch(
-      /SUM\(if\(blob11 = 'beacon', double2 \* _sample_interval, 0\)\)\s*\/\s*SUM\(if\(blob11 = 'beacon', _sample_interval, 0\)\)/,
+      /SUM\(if\(blob11 = 'beacon', double2 \* _sample_interval, 0\.0\)\)\s*\/\s*SUM\(if\(blob11 = 'beacon', _sample_interval, 0\)\)/,
     );
     expect(captured.sql[0]).not.toMatch(/AVG\(if\(blob11 = 'beacon'/);
     expect(captured.sql[0]).not.toMatch(/GROUP BY page_path/);

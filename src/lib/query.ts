@@ -275,8 +275,8 @@ export async function getOverview(
       const sql = `
     SELECT
       SUM(if(blob11 = 'pageview', _sample_interval, 0)) AS total_views,
-      COUNT(DISTINCT if(blob11 = 'pageview', blob3, NULL)) AS unique_visitors,
-      SUM(if(blob11 = 'beacon', double2 * _sample_interval, 0)) /
+      COUNT(DISTINCT blob3) AS unique_visitors,
+      SUM(if(blob11 = 'beacon', double2 * _sample_interval, 0.0)) /
         SUM(if(blob11 = 'beacon', _sample_interval, 0)) AS avg_time_on_page
     FROM ${dataset}
     WHERE blob1 = '${escapeSql(tenantId)}'
@@ -567,14 +567,22 @@ export async function getDashboardSections(
   return withCachedResult(
     `sections:${dataset}:${tenantId}:${days}:${limit}`,
     async () => {
-      const [pages, referrers, geo, devices, events] = await Promise.allSettled(
-        [
-          getTopPages(env, tenantId, days, limit),
-          getTopReferrers(env, tenantId, days, limit),
-          getGeoBreakdown(env, tenantId, days),
-          getDeviceBreakdown(env, tenantId, days),
-          getCustomEvents(env, tenantId, days, limit),
-        ],
+      // Same five-query contract as before, sequenced so Analytics Engine is
+      // not hit with a concurrent cold burst (see getRealtime).
+      const pages = await settleSection("pages", () =>
+        getTopPages(env, tenantId, days, limit),
+      );
+      const referrers = await settleSection("referrers", () =>
+        getTopReferrers(env, tenantId, days, limit),
+      );
+      const geo = await settleSection("geo", () =>
+        getGeoBreakdown(env, tenantId, days),
+      );
+      const devices = await settleSection("devices", () =>
+        getDeviceBreakdown(env, tenantId, days),
+      );
+      const events = await settleSection("events", () =>
+        getCustomEvents(env, tenantId, days, limit),
       );
       return {
         pages: pages.status === "fulfilled" ? pages.value : [],
@@ -593,6 +601,42 @@ export async function getDashboardSections(
     },
     (value) => !Object.values(value.errors).some(Boolean),
   );
+}
+
+async function settleSection<T>(
+  section: keyof DashboardSectionErrors,
+  load: () => Promise<T>,
+): Promise<PromiseSettledResult<T>> {
+  try {
+    return { status: "fulfilled", value: await load() };
+  } catch (reason) {
+    const common = {
+      event: "analytics_section_query_failed",
+      section,
+      errorName: reason instanceof Error ? reason.name : "UnknownError",
+    };
+    if (reason instanceof AnalyticsEngineQueryError) {
+      console.error(
+        JSON.stringify({
+          ...common,
+          upstream: "analytics_engine_sql_api",
+          upstreamStatus: reason.status,
+          upstreamRayId: reason.rayId,
+        }),
+      );
+    } else {
+      console.error(
+        JSON.stringify({
+          ...common,
+          error:
+            reason instanceof Error
+              ? reason.message.slice(0, 512)
+              : String(reason).slice(0, 512),
+        }),
+      );
+    }
+    return { status: "rejected", reason };
+  }
 }
 
 // ─── SQL Escape ──────────────────────────────────────────────────────────────
