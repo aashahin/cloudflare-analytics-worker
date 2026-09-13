@@ -24,6 +24,8 @@ export interface Env {
 
   // Secrets (set via `wrangler secret put`)
   AUTH_TOKEN: string;
+  /** Temporary overlap while existing callers switch to AUTH_TOKEN. Remove after cutover. */
+  AUTH_TOKEN_PREVIOUS?: string;
   CF_API_TOKEN: string;
   FINGERPRINT_SECRET: string;
 

@@ -542,6 +542,24 @@ describe("authenticated query cost guard", () => {
 // ─── Auth Guards ──────────────────────────────────────────────────────────────
 
 describe("auth guards", () => {
+  it("accepts both keys during rotation and rejects retired admin, ingest and scoped tokens", async () => {
+    const current = { ...createMockEnv([]), AUTH_TOKEN: "new-admin-secret", INGEST_TOKEN: undefined };
+    const overlap = { ...current, AUTH_TOKEN_PREVIOUS: "old-admin-secret" };
+    const bearer = (token: string) => new Request("https://analytics.example.com/api/overview", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    for (const secret of [overlap.AUTH_TOKEN, overlap.AUTH_TOKEN_PREVIOUS]) {
+      expect(await verifyAuth(bearer(secret), overlap)).toEqual({ authenticated: true });
+      expect(await verifyIngestAuth(bearer(secret), overlap)).toBe(true);
+    }
+    const scoped = await createScopedToken(overlap.AUTH_TOKEN_PREVIOUS, "tenant_42", 3600);
+    expect(await verifyAuth(bearer(scoped), overlap)).toEqual({ authenticated: true, tenantScope: "tenant_42" });
+    expect(await verifyAuth(bearer(overlap.AUTH_TOKEN_PREVIOUS), current)).toEqual({ authenticated: false });
+    expect(await verifyIngestAuth(bearer(overlap.AUTH_TOKEN_PREVIOUS), current)).toBe(false);
+    expect(await verifyAuth(bearer(scoped), current)).toEqual({ authenticated: false });
+    expect(await verifyAuth(bearer(current.AUTH_TOKEN), current)).toEqual({ authenticated: true });
+    expect(await verifyIngestAuth(bearer(overlap.AUTH_TOKEN_PREVIOUS), { ...overlap, INGEST_TOKEN: "separate-ingest" })).toBe(false);
+  });
   it("rejects blank bearer tokens before comparing secrets", async () => {
     const env = createMockEnv([]);
     const request = new Request("https://analytics.example.com/api/overview", {

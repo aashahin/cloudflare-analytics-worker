@@ -81,14 +81,16 @@ export async function verifyAuth(
   const token = readBearerToken(request);
   const authSecret = configuredSecret(env.AUTH_TOKEN, "AUTH_TOKEN");
   if (!token || !authSecret) return { authenticated: false };
+  const previousSecret = optionalConfiguredSecret(env.AUTH_TOKEN_PREVIOUS, "AUTH_TOKEN_PREVIOUS");
+  const acceptedSecrets = previousSecret ? [authSecret, previousSecret] : [authSecret];
 
   // Admin token — unrestricted access to all tenants
-  if (await timingSafeEqual(token, authSecret)) {
+  if ((await Promise.all(acceptedSecrets.map(secret => timingSafeEqual(token, secret)))).some(Boolean)) {
     return { authenticated: true };
   }
 
   // Scoped token — restricted to a single tenant
-  const scoped = await verifyScopedToken(token, authSecret);
+  const scoped = (await Promise.all(acceptedSecrets.map(secret => verifyScopedToken(token, secret)))).find(Boolean);
   if (scoped) {
     return { authenticated: true, tenantScope: scoped.tenantId };
   }
@@ -105,9 +107,11 @@ export async function verifyIngestAuth(
   const authSecret = configuredSecret(env.AUTH_TOKEN, "AUTH_TOKEN");
   if (!token || !authSecret) return false;
 
-  const ingestSecret =
-    optionalConfiguredSecret(env.INGEST_TOKEN, "INGEST_TOKEN") ?? authSecret;
-  return timingSafeEqual(token, ingestSecret);
+  const ingestSecret = optionalConfiguredSecret(env.INGEST_TOKEN, "INGEST_TOKEN");
+  if (ingestSecret) return timingSafeEqual(token, ingestSecret);
+  const previousSecret = optionalConfiguredSecret(env.AUTH_TOKEN_PREVIOUS, "AUTH_TOKEN_PREVIOUS");
+  const acceptedSecrets = previousSecret ? [authSecret, previousSecret] : [authSecret];
+  return (await Promise.all(acceptedSecrets.map(secret => timingSafeEqual(token, secret)))).some(Boolean);
 }
 
 // ─── Scoped Tenant Tokens (HMAC-based) ───────────────────────────────────────
