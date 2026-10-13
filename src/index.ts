@@ -6,6 +6,8 @@
 //   2. Live queries: SQL API → Analytics Engine
 //   3. No D1 — Analytics Engine is the sole data store.
 
+import { WorkerEntrypoint } from "cloudflare:workers";
+
 import type { Env } from "@/env.ts";
 import { verifyAuth, verifyIngestAuth } from "@/lib/auth.ts";
 import {
@@ -17,7 +19,12 @@ import {
   publicJsonResponse,
   unauthorized,
 } from "@/lib/cors.ts";
-import { trackEvents, type IngestOptions } from "@/lib/ingest.ts";
+import {
+  readForwardedVisitorGeo,
+  trackEvents,
+  type IngestOptions,
+  type VisitorGeo,
+} from "@/lib/ingest.ts";
 import {
   AnalyticsEngineQueryError,
   getCustomEvents,
@@ -219,6 +226,26 @@ export default {
   },
 };
 
+/**
+ * Service-binding-only entrypoint for the tenant storefront's first-party
+ * collect proxy (`"entrypoint": "TenantIngestEntrypoint"` on its binding).
+ *
+ * A named entrypoint has no public route, so reaching it proves the caller is
+ * a Worker bound to it. That is the only reason the forwarded visitor geo is
+ * trusted here: the proxied request carries no `cf` of its own. Nothing else is
+ * widened — tenant resolution, the domain allowlist and rate limits apply
+ * exactly as on the public endpoint, and only POST /api/collect is served.
+ */
+export class TenantIngestEntrypoint extends WorkerEntrypoint<Env> {
+  override async fetch(request: Request): Promise<Response> {
+    const { pathname } = new URL(request.url);
+    if (pathname !== "/api/collect" || request.method !== "POST") {
+      return publicJsonResponse({ error: "Not Found" }, 404);
+    }
+    return handleCollect(request, this.env, readForwardedVisitorGeo(request));
+  }
+}
+
 function logApiError(pathname: string, error: unknown): void {
   const common = {
     event: "analytics_api_request_failed",
@@ -254,6 +281,7 @@ function logApiError(pathname: string, error: unknown): void {
 async function handleCollect(
   request: Request,
   env: Env,
+  forwardedGeo: VisitorGeo = {},
 ): Promise<Response> {
   // Authenticated server-to-server ingest skips the public collect limiter.
   const ingestAuthenticated = await verifyIngestAuth(request, env);
@@ -338,6 +366,7 @@ async function handleCollect(
       events.map((event) =>
         buildCollectEvent({ event, tenantId, isServerToServer }),
       ),
+      forwardedGeo,
     );
 
     // 204 No Content — minimal response for tracker

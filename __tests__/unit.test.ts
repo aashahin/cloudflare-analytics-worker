@@ -7,6 +7,7 @@ import worker, {
   canonicalQueryBucket,
   QUERY_DAY_BUCKETS,
   QUERY_LIMIT_BUCKETS,
+  TenantIngestEntrypoint,
 } from "../src/index.ts";
 import type { Env } from "../src/env.ts";
 import {
@@ -726,6 +727,87 @@ describe("collect endpoint", () => {
     expect(dataPoints[0]?.indexes?.[0]).toBe("tenant_1");
     expect(dataPoints[0]?.blobs?.[3]).toBe("XX");
     expect(dataPoints[0]?.blobs?.[4]).toBe("");
+  });
+
+  function proxiedBeacon(
+    url = "https://analytics-worker.internal/api/collect",
+    geo: Record<string, string> = {
+      "x-manhali-visitor-country": "EG",
+      "x-manhali-visitor-city": encodeURIComponent("الإسكندرية"),
+    },
+  ): Request {
+    return new Request(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain;charset=UTF-8",
+        Origin: "https://example.com",
+        "User-Agent": browserUa,
+        "CF-Connecting-IP": "203.0.113.10",
+        ...geo,
+      },
+      body: JSON.stringify({ t: "pageview", p: "/", sid: "tenant_1" }),
+    });
+  }
+
+  function ingestEntrypoint(env: Env): TenantIngestEntrypoint {
+    return new TenantIngestEntrypoint({} as ExecutionContext, env);
+  }
+
+  it("records the forwarded visitor geo on the service-binding entrypoint", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const response = await ingestEntrypoint(createMockEnv(dataPoints)).fetch(proxiedBeacon());
+
+    expect(response.status).toBe(204);
+    expect(dataPoints[0]?.blobs?.[3]).toBe("EG");
+    expect(dataPoints[0]?.blobs?.[4]).toBe("الإسكندرية");
+  });
+
+  it("keeps the edge geo ahead of a forwarded one and ignores malformed values", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const entrypoint = ingestEntrypoint(createMockEnv(dataPoints));
+    const withEdgeGeo = proxiedBeacon();
+    Object.defineProperty(withEdgeGeo, "cf", { value: { country: "SA", city: "Riyadh" } });
+
+    await entrypoint.fetch(withEdgeGeo);
+    await entrypoint.fetch(
+      proxiedBeacon(undefined, {
+        "x-manhali-visitor-country": "EGY",
+        "x-manhali-visitor-city": "%E0%A4%A",
+      }),
+    );
+
+    expect(dataPoints.map((point) => point.blobs?.slice(3, 5))).toEqual([
+      ["SA", "Riyadh"],
+      ["XX", ""],
+    ]);
+  });
+
+  it("ignores forwarded geo headers on the public collect endpoint", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const response = await worker.fetch(
+      proxiedBeacon("https://analytics.example.com/api/collect"),
+      createMockEnv(dataPoints),
+    );
+
+    expect(response.status).toBe(204);
+    expect(dataPoints[0]?.blobs?.[3]).toBe("XX");
+    expect(dataPoints[0]?.blobs?.[4]).toBe("");
+  });
+
+  it("serves only POST /api/collect on the service-binding entrypoint", async () => {
+    const env = createMockEnv([]);
+    const entrypoint = ingestEntrypoint(env);
+    const admin = await entrypoint.fetch(
+      new Request("https://analytics-worker.internal/api/admin/domains?tenant_id=tenant_1", {
+        headers: { Authorization: `Bearer ${env.AUTH_TOKEN}` },
+      }),
+    );
+    const tracker = await entrypoint.fetch(
+      new Request("https://analytics-worker.internal/tracker.js"),
+    );
+
+    expect(admin.status).toBe(404);
+    expect(tracker.status).toBe(404);
   });
 
   it("rejects production browser collection when the tenant has no registered domains", async () => {

@@ -97,8 +97,13 @@ name = "manhali-analytics-sandbox"
 account_id = "a793ff57a25dfe6874a8738f9addd295"
 workers_dev = true
 preview_urls = true
-# No manhali.com custom domain on the sandbox account (routes not inherited when empty).
-routes = []
+# The sandbox's own host. The tenant Worker's `*.manhali.dev/*` wildcard is a Route, and Routes run before
+# Custom Domains, so a more-specific zone Route keeps this host here (as dash/api do). workers.dev stays on
+# as a backup host.
+routes = [
+  { pattern = "analytics.manhali.dev", custom_domain = true },
+  { pattern = "analytics.manhali.dev/*", zone_name = "manhali.dev" },
+]
 
 [env.sandbox.limits]
 # The Sandbox account uses Workers Free, which rejects any explicit CPU limit.

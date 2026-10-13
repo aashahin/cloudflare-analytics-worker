@@ -27,6 +27,40 @@ export interface IngestOptions {
   cityOverride?: string;
 }
 
+/** Visitor geo relayed by a trusted proxy hop whose own request has no `cf`. */
+export interface VisitorGeo {
+  country?: string;
+  city?: string;
+}
+
+export const VISITOR_COUNTRY_HEADER = "x-manhali-visitor-country";
+/** URI-encoded: city names are not limited to header-safe Latin-1. */
+export const VISITOR_CITY_HEADER = "x-manhali-visitor-city";
+
+const COUNTRY_CODE = /^[A-Z]{2}$/;
+const MAX_CITY_LENGTH = 100;
+
+/**
+ * Read the visitor geo a trusted proxy forwarded. Only call this for requests
+ * that arrived through the service-binding-only entrypoint: on the public
+ * endpoint these headers are caller-controlled.
+ */
+export function readForwardedVisitorGeo(request: Request): VisitorGeo {
+  const geo: VisitorGeo = {};
+  const country = request.headers.get(VISITOR_COUNTRY_HEADER)?.trim().toUpperCase();
+  if (country && COUNTRY_CODE.test(country)) geo.country = country;
+  const rawCity = request.headers.get(VISITOR_CITY_HEADER);
+  if (rawCity) {
+    try {
+      const city = decodeURIComponent(rawCity).replace(/[\u0000-\u001f\u007f]/g, "").trim();
+      if (city) geo.city = city.slice(0, MAX_CITY_LENGTH);
+    } catch {
+      // Malformed percent-encoding: drop the city, keep the event.
+    }
+  }
+  return geo;
+}
+
 /**
  * Track a page view or event by writing a data point to Analytics Engine.
  * Extracts geo, device, and visitor data from the request automatically.
@@ -51,6 +85,7 @@ export async function trackEvents(
   request: Request,
   env: Env,
   options: readonly IngestOptions[],
+  forwardedGeo: VisitorGeo = {},
 ): Promise<void> {
   if (options.length === 0) return;
 
@@ -96,8 +131,10 @@ export async function trackEvents(
         tenantId,
         event.pagePath,
         visitorHash,
-        event.countryOverride || (cf?.country as string) || "XX",
-        event.cityOverride || (cf?.city as string) || "",
+        // The edge's own geo wins; a proxied request (service binding) has no
+        // `cf`, so it falls back to what the trusted proxy forwarded.
+        event.countryOverride || (cf?.country as string) || forwardedGeo.country || "XX",
+        event.cityOverride || (cf?.city as string) || forwardedGeo.city || "",
         deviceType,
         referrer,
         event.utmSource ?? "",
