@@ -44,9 +44,20 @@ function readBearerToken(request: Request): string | null {
   return token.length > 0 ? token : null;
 }
 
+// A missing or empty secret is reported once per isolate: the check runs on
+// every authenticated request, and repeating the line would dominate the log
+// stream of a misconfigured deployment.
+const reportedSecretProblems = new Set<string>();
+
+function reportSecretProblemOnce(message: string): void {
+  if (reportedSecretProblems.has(message)) return;
+  reportedSecretProblems.add(message);
+  console.error(`[Auth] ${message}`);
+}
+
 function configuredSecret(value: string | undefined, name: string): string | null {
   if (typeof value !== "string" || value.trim().length === 0) {
-    console.error(`[Auth] Required secret ${name} is not configured`);
+    reportSecretProblemOnce(`Required secret ${name} is not configured`);
     return null;
   }
 
@@ -59,7 +70,7 @@ function optionalConfiguredSecret(
 ): string | null {
   if (value === undefined) return null;
   if (value.trim().length === 0) {
-    console.error(`[Auth] Optional secret ${name} is configured but empty`);
+    reportSecretProblemOnce(`Optional secret ${name} is configured but empty`);
     return null;
   }
 

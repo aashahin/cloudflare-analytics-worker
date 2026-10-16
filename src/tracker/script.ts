@@ -62,11 +62,14 @@ function tx(d){
 }
 function s(a,o,en,pp){tx(p(a,o,en,pp))}
 
+// A session under ~0.5s has no time-on-page to report; leaving the beacon flag
+// unset means a later hide (after the visitor stays longer) still beacons.
 function beacon(){
   if(bs)return null;
-  bs=true;
   var dur=Math.round((Date.now()-t)/1000);
-  return dur>0?p("beacon",dur,0,lp):null;
+  if(dur<=0)return null;
+  bs=true;
+  return p("beacon",dur,0,lp);
 }
 function sendBeacon(){var d=beacon();if(d)tx(d)}
 

@@ -29,12 +29,15 @@ bun install
 # Start local dev server
 bun run dev
 # → Wrangler dev (configured: http://localhost:8790)
+# Copy .dev.vars.example to .dev.vars first: the checked-in vars default to
+# production behavior (KV allowlist enforced, limits fail closed).
 
 # Run tests
 bun run test
 
-# Deploy to Cloudflare
-bun run deploy
+# Deploy to Cloudflare (production / sandbox)
+bun run deploy:production
+bun run deploy:sandbox
 
 # View real-time logs
 bun run tail
@@ -82,7 +85,8 @@ wrangler secret put INGEST_TOKEN         # optional dedicated token for server-t
 ### 4. Deploy
 
 ```bash
-bun run deploy
+bun run deploy:production
+bun run deploy:sandbox
 ```
 
 ### 5. Register tenant domains
@@ -166,10 +170,14 @@ Query routes require `Authorization: Bearer <token>` and `?tenant_id=`.
 
 Positive numeric values between supported buckets round up to the next bucket;
 invalid values use the documented default. This deliberately bounds query-cache
-cardinality. Query routes are also limited to 60 requests/minute per Cloudflare
-location, both per token and per tenant-and-token pair, preventing an admin
-token from evading the bound with random tenant IDs. They fail closed outside
-local development when the binding is unavailable.
+cardinality. Query routes are also limited per Cloudflare location: scoped
+tokens get 60 requests/minute each (counted per token and per tenant-and-token
+pair), while the shared admin token has its own higher 240 requests/minute
+namespace so one dashboard token serving every tenant is not throttled
+globally. Failed authentication attempts share a 60 requests/minute per-IP
+bucket in the same namespace. They fail closed outside local development when
+the binding is unavailable. Each upstream Analytics Engine SQL call is capped at
+10 seconds, so `/api/sections` degrades section-by-section instead of stalling.
 
 ### Admin API
 
@@ -209,7 +217,9 @@ Tenant resolution priority on collect:
 
 `wrangler.toml` defaults to `ENVIRONMENT=production` so deployments enforce the KV domain allowlist unless you explicitly override it for local development.
 
-> **Trust model for browser collection.** Like every client-side beacon endpoint (GA, Plausible, Fathom), `/api/collect` is unauthenticated and the `Origin`/`Referer` allowlist is only a best-effort filter — a non-browser client can spoof those headers, and the `sid` is public (it ships in `/tracker.js`). Treat browser-submitted analytics as best-effort, not tamper-proof; use the server-to-server `tid` + Bearer path for trusted data. Per Cloudflare location, the Worker enforces 120 events/minute per IP (60 complete pageview+beacon lifecycles) and 1,200 events/minute per site and origin before domain KV resolution. Never leave `ALLOW_UNREGISTERED_DOMAINS="true"` enabled outside a short onboarding window (it disables origin checks entirely).
+> **Trust model for browser collection.** Like every client-side beacon endpoint (GA, Plausible, Fathom), `/api/collect` is unauthenticated and the `Origin`/`Referer` allowlist is only a best-effort filter — a non-browser client can spoof those headers, and the `sid` is public (it ships in `/tracker.js`). Treat browser-submitted analytics as best-effort, not tamper-proof; use the server-to-server `tid` + Bearer path for trusted data. Per Cloudflare location, the Worker enforces 300 events/minute per IP (150 complete pageview+beacon lifecycles) and 1,200 events/minute per site and origin before domain KV resolution. Rate-limit bindings are per-location and eventually consistent, so treat these as an approximate abuse bound rather than exact accounting. Authenticated server-to-server ingest skips both public limits and the UA bot filter (backend clients legitimately send library user agents such as `undici` or `curl`; browser-shaped traffic is still filtered). Never leave `ALLOW_UNREGISTERED_DOMAINS="true"` enabled outside a short onboarding window (it disables origin checks entirely). The flag only applies to tenants with **no** allowlist entry: once a tenant exists in KV an empty domain list is an explicit deny-all, not a grace period.
+
+> **Sandbox environment.** The sandbox runs on Workers Free with `ALLOW_UNREGISTERED_DOMAINS="true"` and keeps `workers.dev` enabled as a backup host, so anyone can write forged events into the sandbox dataset for any valid `sid`. That is intentional for testing; it is bounded only by the same rate limits and by Analytics Engine's free budget (100,000 data points and 10,000 read queries per day), which the sandbox shares with local and CI seeding. Keep sandbox data untrusted and never point production dashboards at it.
 
 ## Cloudflare Bindings
 
@@ -220,6 +230,7 @@ Tenant resolution priority on collect:
 | `COLLECT_RATE_LIMIT`     | Rate Limit       | Public collect quota per client IP           |
 | `SITE_COLLECT_RATE_LIMIT` | Rate Limit      | Site and origin quota before KV lookup       |
 | `QUERY_RATE_LIMIT`       | Rate Limit       | Authenticated reads per tenant/token subject |
+| `QUERY_RATE_LIMIT_ADMIN` | Rate Limit       | Higher read quota for the shared admin token |
 
 ## Environment
 
@@ -227,7 +238,7 @@ Tenant resolution priority on collect:
 | ---------------------------- | ------ | ------------------------------------------------------------ |
 | `AUTH_TOKEN`                 | Secret | Admin API token and scoped-token signing secret              |
 | `CF_API_TOKEN`               | Secret | Cloudflare API token for Analytics Engine SQL queries        |
-| `FINGERPRINT_SECRET`         | Secret | Dedicated secret for privacy-safe visitor hashing            |
+| `FINGERPRINT_SECRET`         | Secret | Required salt for visitor hashing (ingest fails closed while unset) |
 | `INGEST_TOKEN`               | Secret | Optional separate token for server-to-server ingestion       |
 | `ACCOUNT_ID`                 | Var    | Cloudflare account ID                                        |
 | `ENVIRONMENT`                | Var    | `development`, `staging`, or `production`                     |

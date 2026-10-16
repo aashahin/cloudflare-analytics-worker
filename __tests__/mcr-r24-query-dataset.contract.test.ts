@@ -12,7 +12,6 @@ import { join } from "node:path";
 import type { Env } from "../src/env.ts";
 import {
   clearAnalyticsQueryCache,
-  clearDashboardSectionsCache,
   getDashboardSections,
   getOverview,
   getRealtime,
@@ -257,11 +256,16 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
     expect(production).toMatch(/invocation_logs\s*=\s*false/);
     expect(production).toMatch(/name\s*=\s*"COLLECT_RATE_LIMIT"/);
     expect(production).toMatch(/namespace_id\s*=\s*"1101"/);
-    expect(production).toMatch(/simple\s*=\s*\{\s*limit\s*=\s*120,\s*period\s*=\s*60\s*\}/);
+    expect(production).toMatch(/simple\s*=\s*\{\s*limit\s*=\s*300,\s*period\s*=\s*60\s*\}/);
     expect(production).toMatch(/name\s*=\s*"SITE_COLLECT_RATE_LIMIT"/);
     expect(production).toMatch(/namespace_id\s*=\s*"1102"/);
     expect(production).toMatch(/name\s*=\s*"QUERY_RATE_LIMIT"/);
     expect(production).toMatch(/namespace_id\s*=\s*"1103"/);
+    expect(production).toMatch(/name\s*=\s*"QUERY_RATE_LIMIT_ADMIN"/);
+    expect(production).toMatch(/namespace_id\s*=\s*"1104"/);
+    // A legacy Cron Trigger is only removed when the config sets crons = [];
+    // omitting the key leaves any attached trigger in place.
+    expect(production).toMatch(/\[triggers\][\s\S]*?crons\s*=\s*\[\]/);
     expect(sandbox).toMatch(/head_sampling_rate\s*=\s*0\.1/);
     expect(sandbox).toMatch(/\[env\.sandbox\.observability\.logs\][\s\S]*?head_sampling_rate\s*=\s*0\.1/);
     expect(sandbox).toMatch(/invocation_logs\s*=\s*false/);
@@ -271,6 +275,8 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
     expect(sandbox).toMatch(/namespace_id\s*=\s*"2102"/);
     expect(sandbox).toMatch(/name\s*=\s*"QUERY_RATE_LIMIT"/);
     expect(sandbox).toMatch(/namespace_id\s*=\s*"2103"/);
+    expect(sandbox).toMatch(/name\s*=\s*"QUERY_RATE_LIMIT_ADMIN"/);
+    expect(sandbox).toMatch(/namespace_id\s*=\s*"2104"/);
     expect(production).toMatch(/\[limits\][\s\S]*?cpu_ms\s*=\s*500/);
     expect(sandbox).toMatch(/\[env\.sandbox\.limits\]/);
     expect(sandbox).not.toMatch(/cpu_ms\s*=/);
@@ -283,7 +289,7 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
   });
 
   it("dashboard sections fan-out is one cacheable round trip per tenant window", async () => {
-    clearDashboardSectionsCache();
+    clearAnalyticsQueryCache();
     const env = createQueryEnv(SANDBOX_DATASET);
     const captured = captureSql(env);
 
@@ -305,7 +311,7 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
     expect(second.errors).toEqual(first.errors);
 
     captured.restore();
-    clearDashboardSectionsCache();
+    clearAnalyticsQueryCache();
   });
 
   it("getOverview is one SQL with unique visitors and avg time, not top pages", async () => {
@@ -389,5 +395,49 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
     expect(captured.sql).toHaveLength(billed);
 
     captured.restore();
+  });
+
+  it("recovers Cache API access after a failed caches.open", async () => {
+    // A rejected caches.open() promise must not be memoized for the isolate's
+    // lifetime, or one transient failure would silently disable colo caching.
+    const entries = new Map<string, string>();
+    let cacheOpenFailsOnce = true;
+    (globalThis as { caches: Partial<CacheStorage> }).caches = {
+      open: async () => {
+        if (cacheOpenFailsOnce) {
+          cacheOpenFailsOnce = false;
+          throw new Error("cache unavailable");
+        }
+        return {
+          match: async (request: RequestInfo | URL) => {
+            const url =
+              request instanceof Request ? request.url : String(request);
+            const body = entries.get(url);
+            return body === undefined
+              ? undefined
+              : new Response(body, {
+                  headers: { "content-type": "application/json" },
+                });
+          },
+          put: async (request: RequestInfo | URL, response: Response) => {
+            const url =
+              request instanceof Request ? request.url : String(request);
+            entries.set(url, await response.clone().text());
+          },
+        } as unknown as Cache;
+      },
+    } as unknown as CacheStorage;
+
+    const env = createQueryEnv(SANDBOX_DATASET);
+    const captured = captureSql(env);
+
+    await getOverview(env, "tenant_cache_retry", 7);
+    clearAnalyticsQueryCache();
+    await getOverview(env, "tenant_cache_retry", 7);
+
+    captured.restore();
+    // The failed open is retried by the next cache operation, so the second
+    // overview is served from the Cache API instead of the SQL API.
+    expect(captured.sql).toHaveLength(1);
   });
 });

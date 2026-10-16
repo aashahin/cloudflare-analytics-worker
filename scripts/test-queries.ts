@@ -7,7 +7,7 @@
 
 const WORKER_URL =
     process.env.ANALYTICS_WORKER_URL ??
-    "https://manhali-analytics.abshahin.workers.dev";
+    "https://analytics.worker.manhali.com";
 
 const AUTH_TOKEN = requireEnv("ANALYTICS_AUTH_TOKEN");
 
@@ -83,7 +83,7 @@ async function main() {
             const data = await fetchRoute(route, {
                 tenant_id: TENANT_ID,
                 days: days.toString(),
-                limit: "5", // Keeping the output relatively small
+                limit: "10", // Smallest supported limit bucket, keeps output short
             });
 
             console.dir(data, { depth: null, colors: true });

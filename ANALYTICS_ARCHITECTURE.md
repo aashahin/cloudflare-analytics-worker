@@ -162,6 +162,11 @@ If a production site has no registered domains:
 - default behavior: reject browser collect requests
 - optional grace period: allow requests only when `ALLOW_UNREGISTERED_DOMAINS="true"`
 
+An allowlist that exists but is empty (`[]`) is an **explicit deny-all** (rejected
+with "This site has no allowed origins"): the grace flag only applies to tenants
+with no KV entry at all. Removing a tenant's last domain therefore keeps the site
+closed instead of silently re-opening it to the grace period.
+
 Admin mutations call `invalidateDomainCache`, but that only clears the cache on
 the single isolate that served the admin request. Other warm isolates across the
 edge keep their cached allowlist until their own five-minute TTL expires, so
@@ -169,6 +174,15 @@ domain adds and removals are **eventually consistent within ~5 minutes**, not
 globally immediate. This matters most on removal: a de-authorized origin can keep
 being accepted on other warm isolates for up to the TTL window. Lower
 `DOMAIN_CACHE_TTL_MS` if a shorter propagation window is required.
+
+KV has no compare-and-swap, and Cloudflare documents that a write is only
+*usually* immediately visible — even in the location that made it — so the admin
+API chains domain writes per tenant within an isolate, preventing concurrent adds
+or removes from losing each other's update. A cross-location race (two admins in
+different locations, or an admin edit racing the backend sync that also writes
+this key) can still drop an update; if that ever needs stronger guarantees, route
+these writes through a Durable Object, as Cloudflare's KV consistency guidance
+recommends.
 
 ---
 
@@ -272,15 +286,25 @@ The query layer validates `tenantId` before embedding it into SQL and escapes si
 - No client-side fingerprinting
 - Visitor identity rotates daily, preventing cross-day tracking
 
-`POST /api/collect` is rate-limited in-worker, per Cloudflare location, at 120
+`POST /api/collect` is rate-limited in-worker, per Cloudflare location, at 300
 events/minute per `CF-Connecting-IP` and 1,200 events/minute per site plus per
-origin. The first threshold allows 60 complete pageview+beacon lifecycles per
-minute; the second caps 600 lifecycles and runs before domain KV. Authenticated
-server-to-server ingest skips both public limits. Authenticated query routes
-have separate 60 requests/minute/location counters for a SHA-256-derived token
-subject and for its tenant/token pair, so changing tenant IDs cannot evade the
-token-wide cap. All three bindings fail closed outside local development;
-exceeded limits return `429` with the appropriate CORS policy.
+origin. The first threshold allows 150 complete pageview+beacon lifecycles per
+minute, sized so visitors behind shared/NAT client IPs do not throttle each
+other; the second caps 600 lifecycles and runs before domain KV. Counters are
+per-location and eventually consistent, so they are an approximate abuse bound
+rather than exact accounting. Authenticated server-to-server ingest skips both
+public limits and the UA bot filter (library user agents such as `undici` or
+`curl` are legitimate there and would otherwise be dropped silently).
+Authenticated query routes have separate counters per location: 60
+requests/minute for scoped tokens (a SHA-256-derived token subject plus its
+tenant/token pair, so changing tenant IDs cannot evade the token-wide cap) and a
+higher 240 requests/minute namespace for the shared admin token, which would
+otherwise throttle every tenant's dashboard at once. Failed authentication
+attempts consume a 60 requests/minute per-IP bucket in the query namespace. All
+bindings fail closed outside local development, exceeded limits return `429` with
+the appropriate CORS policy, and each Analytics Engine SQL call aborts after 10
+seconds. Rejected collect requests emit a `rate_limit_tripped` log at most once
+per scope per minute so an attacker cannot amplify the log budget.
 
 ---
 
@@ -305,7 +329,13 @@ The generated tracker script is intentionally small and framework-agnostic.
 ### Transport
 
 - Primary: `navigator.sendBeacon()`
-- Fallback: `XMLHttpRequest`
+- Fallbacks: `fetch(..., { keepalive: true })`, then `XMLHttpRequest`
+
+The beacon helper only emits a time-on-page beacon once a page has been visible
+for at least ~0.5 s, and leaves its sent-flag unset when it does not — a session
+that starts with a quick hide still beacons after a later, longer visit. Hash-only
+navigation (`#/route`) never emits a pageview: fragment changes are not tracked so
+that anchor links are not counted as page views.
 
 ### Response caching
 
@@ -368,7 +398,8 @@ bun run dev
 bun run test
 
 # Deploy
-bun run deploy
+bun run deploy:production
+bun run deploy:sandbox
 
 # Tail logs
 bun run tail

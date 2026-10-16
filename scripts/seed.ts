@@ -9,7 +9,7 @@
 
 const WORKER_URL =
   process.env.ANALYTICS_WORKER_URL ??
-  "https://manhali-analytics.abshahin.workers.dev";
+  "https://analytics.worker.manhali.com";
 
 const AUTH_TOKEN = requireEnv("ANALYTICS_AUTH_TOKEN");
 

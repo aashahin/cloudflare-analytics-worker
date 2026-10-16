@@ -1,0 +1,18 @@
+# Copy to `.dev.vars` for `wrangler dev` (gitignored). Local development has to
+# opt out of the production defaults in wrangler.toml:
+#   ENVIRONMENT=development             skip the KV domain allowlist and let
+#                                       collect keep working when the rate-limit
+#                                       bindings are unavailable locally
+#   ALLOW_UNREGISTERED_DOMAINS="true"   accept sites whose domains are not in the
+#                                       local KV yet
+ENVIRONMENT = "development"
+ALLOW_UNREGISTERED_DOMAINS = "true"
+ACCOUNT_ID = "local-dev-account"
+ANALYTICS_DATASET = "manhali_analytics"
+
+# Placeholder secrets so local requests are shaped like deployed ones. Never put
+# real production values in this file.
+AUTH_TOKEN = "local-dev-admin-token"
+FINGERPRINT_SECRET = "local-dev-fingerprint-secret"
+CF_API_TOKEN = "local-dev-cf-api-token"
+INGEST_TOKEN = "local-dev-ingest-token"

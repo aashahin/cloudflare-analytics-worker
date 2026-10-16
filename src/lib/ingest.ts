@@ -33,6 +33,18 @@ export interface VisitorGeo {
   city?: string;
 }
 
+/** Request-scoped context shared by every event in one collect call. */
+export interface IngestRequestContext {
+  /** Geo relayed by the trusted service-binding proxy, when `cf` is absent. */
+  forwardedGeo?: VisitorGeo;
+  /**
+   * Verified server-to-server ingest. Bypasses the UA bot filter because
+   * backends legitimately send library user agents (`undici`, `node`, `axios`,
+   * `curl`, …) that the public filter would otherwise drop with a silent 204.
+   */
+  serverToServer?: boolean;
+}
+
 export const VISITOR_COUNTRY_HEADER = "x-manhali-visitor-country";
 /** URI-encoded: city names are not limited to header-safe Latin-1. */
 export const VISITOR_CITY_HEADER = "x-manhali-visitor-city";
@@ -62,36 +74,25 @@ export function readForwardedVisitorGeo(request: Request): VisitorGeo {
 }
 
 /**
- * Track a page view or event by writing a data point to Analytics Engine.
- * Extracts geo, device, and visitor data from the request automatically.
- *
- * Bot traffic is filtered using UA-based detection (no Enterprise plan needed).
- * UTM params and referrer should be passed explicitly from the collect payload
- * (the tracker sends document.referrer and URL UTM params in the JSON body).
- */
-export async function trackEvent(
-  request: Request,
-  env: Env,
-  options: IngestOptions,
-): Promise<void> {
-  return trackEvents(request, env, [options]);
-}
-
-/**
  * Track a small group of events received in one request while calculating the
  * privacy-safe visitor fingerprint and request metadata only once.
+ *
+ * Bot traffic is filtered using UA-based detection (no Enterprise plan needed),
+ * except for verified server-to-server ingest. UTM params and referrer arrive
+ * explicitly in the collect payload (the tracker sends document.referrer and
+ * URL UTM params in the JSON body).
  */
 export async function trackEvents(
   request: Request,
   env: Env,
   options: readonly IngestOptions[],
-  forwardedGeo: VisitorGeo = {},
+  context: IngestRequestContext = {},
 ): Promise<void> {
   if (options.length === 0) return;
 
   // ─── Bot Filtering (UA-based, free tier) ─────────────────────────────────
   const userAgent = request.headers.get("User-Agent") ?? "";
-  if (isBot(userAgent)) return;
+  if (!context.serverToServer && isBot(userAgent)) return;
 
   const tenantId = options[0]!.tenantId;
   if (options.some((event) => event.tenantId !== tenantId)) {
@@ -100,7 +101,16 @@ export async function trackEvents(
 
   // ─── Extract Request Metadata ────────────────────────────────────────────
 
+  // The edge always sets CF-Connecting-IP on the public endpoint; the sentinel
+  // only covers local runs where neither the header nor `cf` exists.
   const ip = request.headers.get("CF-Connecting-IP") ?? "0.0.0.0";
+
+  const fingerprintSecret = env.FINGERPRINT_SECRET;
+  if (typeof fingerprintSecret !== "string" || fingerprintSecret.trim().length === 0) {
+    // Fail closed: without the salt every visitor hash degenerates to a
+    // predictable constant, silently degrading the privacy guarantee.
+    throw new Error("Required secret FINGERPRINT_SECRET is not configured");
+  }
 
   // Privacy-safe visitor hash for unique visitor aggregation.
   // Uses a dedicated secret (separate from AUTH_TOKEN for defense in depth),
@@ -112,7 +122,7 @@ export async function trackEvents(
     ip,
     userAgent,
     dayBucket,
-    env.FINGERPRINT_SECRET,
+    fingerprintSecret,
   );
 
   const cf = request.cf as IncomingRequestCfProperties | undefined;
@@ -133,8 +143,8 @@ export async function trackEvents(
         visitorHash,
         // The edge's own geo wins; a proxied request (service binding) has no
         // `cf`, so it falls back to what the trusted proxy forwarded.
-        event.countryOverride || (cf?.country as string) || forwardedGeo.country || "XX",
-        event.cityOverride || (cf?.city as string) || forwardedGeo.city || "",
+        event.countryOverride || (cf?.country as string) || context.forwardedGeo?.country || "XX",
+        event.cityOverride || (cf?.city as string) || context.forwardedGeo?.city || "",
         deviceType,
         referrer,
         event.utmSource ?? "",

@@ -34,8 +34,14 @@ export function safeInt(
  *  drops every data point for that tenant. IDs are ASCII, so chars == bytes. */
 export const SAFE_TENANT_ID = /^[a-zA-Z0-9_\-.:]{1,64}$/;
 
+/** Remove ASCII control characters from caller-supplied text so they cannot
+ *  corrupt logs, Analytics Engine blobs, or CSV exports downstream. */
+export function stripControlCharacters(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f]/g, "");
+}
+
 /** Sanitize a page path: limit length, strip query string and fragment. */
 export function sanitizePath(path: string): string {
-  const clean = path.split("?")[0]!.split("#")[0]!;
+  const clean = stripControlCharacters(path.split("?")[0]!.split("#")[0]!);
   return clean.slice(0, 2048);
 }

@@ -10,8 +10,8 @@ export interface Env {
 
   /**
    * Workers Rate Limit binding (`[[ratelimits]]` in wrangler.toml).
-   * POST /api/collect is limited to 120 requests / 60s per CF-Connecting-IP
-   * and Cloudflare location, enough for 60 complete pageview+beacon lifecycles.
+   * POST /api/collect is limited to 300 events / 60s per CF-Connecting-IP and
+   * Cloudflare location, i.e. 150 complete pageview+beacon lifecycles.
    * Authenticated server-to-server ingest skips this limiter.
    */
   COLLECT_RATE_LIMIT: RateLimit;
@@ -19,14 +19,25 @@ export interface Env {
   /** Per-location browser quota keyed by site and origin before domain KV reads. */
   SITE_COLLECT_RATE_LIMIT: RateLimit;
 
-  /** Per-location query quota keyed by tenant and a hash of the bearer token. */
+  /**
+   * Per-location query quota keyed by tenant and a hash of the bearer token.
+   * Also carries the `unauth:{ip}` bucket that throttles failed auth attempts.
+   */
   QUERY_RATE_LIMIT: RateLimit;
+
+  /**
+   * Higher query ceiling for the shared admin token so one dashboard token
+   * serving every tenant is not capped by the scoped-token limit. Falls back to
+   * QUERY_RATE_LIMIT when the binding is absent.
+   */
+  QUERY_RATE_LIMIT_ADMIN?: RateLimit;
 
   // Secrets (set via `wrangler secret put`)
   AUTH_TOKEN: string;
   /** Temporary overlap while existing callers switch to AUTH_TOKEN. Remove after cutover. */
   AUTH_TOKEN_PREVIOUS?: string;
   CF_API_TOKEN: string;
+  /** Required: salt for the visitor hash. Ingest fails closed while it is unset. */
   FINGERPRINT_SECRET: string;
 
   // Optional separate token for server-to-server ingestion (falls back to AUTH_TOKEN)

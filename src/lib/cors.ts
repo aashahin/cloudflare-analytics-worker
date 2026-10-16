@@ -16,6 +16,9 @@ export function privateCorsHeaders(request: Request): HeadersInit {
     "Access-Control-Allow-Origin": origin,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    // Authenticated payloads (tenant analytics, admin domain lists, minted
+    // tokens) must never be stored by browsers or intermediaries.
+    "Cache-Control": "no-store",
     Vary: "Origin",
   };
 }
@@ -69,5 +72,17 @@ export function badRequest(request: Request, message: string): Response {
   return Response.json(
     { error: message },
     { status: 400, headers: privateCorsHeaders(request) },
+  );
+}
+
+/**
+ * 405 for a known path reached with the wrong method. The caller supplies the
+ * route's CORS headers so the response carries the same origin policy as the
+ * endpoint it describes.
+ */
+export function methodNotAllowed(headers: HeadersInit, allow: string): Response {
+  return Response.json(
+    { error: "Method Not Allowed" },
+    { status: 405, headers: { ...headers, Allow: allow } },
   );
 }

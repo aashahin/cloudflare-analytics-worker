@@ -14,6 +14,8 @@ import {
   badRequest,
   forbidden,
   handleCors,
+  methodNotAllowed,
+  privateCorsHeaders,
   privateJsonResponse,
   publicCorsHeaders,
   publicJsonResponse,
@@ -42,6 +44,7 @@ import {
   extractHostname,
   SAFE_TENANT_ID,
   sanitizePath,
+  stripControlCharacters,
 } from "@/lib/utils.ts";
 import { handleAdminRoutes } from "@/routes/admin.ts";
 import { getTrackerHeaders, getTrackerScript } from "@/tracker/script.ts";
@@ -93,18 +96,27 @@ export default {
 
     // Health check
     if (pathname === "/health") {
+      if (method !== "GET" && method !== "HEAD") {
+        return methodNotAllowed(publicCorsHeaders(), "GET, HEAD");
+      }
       return publicJsonResponse({ status: "ok", service: "manhali-analytics" });
     }
 
     // Tracker script — parameterized with collect endpoint and optional site ID
-    if (pathname === "/tracker.js" && method === "GET") {
+    if (pathname === "/tracker.js") {
+      if (method !== "GET" && method !== "HEAD") {
+        return methodNotAllowed(publicCorsHeaders(), "GET, HEAD");
+      }
       const siteId = url.searchParams.get("sid") ?? "";
       const script = getTrackerScript(`${url.origin}/api/collect`, siteId);
       return new Response(script, { headers: getTrackerHeaders() });
     }
 
     // Event collection (no auth — called by tracker script from browsers)
-    if (pathname === "/api/collect" && method === "POST") {
+    if (pathname === "/api/collect") {
+      if (method !== "POST") {
+        return methodNotAllowed(publicCorsHeaders(), "POST");
+      }
       return handleCollect(request, env);
     }
 
@@ -112,7 +124,11 @@ export default {
 
     try {
       const auth = await verifyAuth(request, env);
-      if (!auth.authenticated) return unauthorized(request);
+      if (!auth.authenticated) {
+        const limited = await applyFailedAuthRateLimit(request, env);
+        if (limited) return limited;
+        return unauthorized(request);
+      }
 
       // ── Admin Routes (require admin token, not scoped tokens) ──────────────
 
@@ -143,7 +159,21 @@ export default {
       }
 
       if (QUERY_PATHS.has(pathname)) {
-        const limited = await applyQueryRateLimit(request, env, tenantId!);
+        if (method !== "GET" && method !== "HEAD") {
+          return methodNotAllowed(privateCorsHeaders(request), "GET, HEAD");
+        }
+        // Scoped tokens keep the tight per-token ceiling; the shared admin
+        // token gets its own higher namespace so one dashboard token serving
+        // every tenant does not become a global 60/min throttle.
+        const queryLimiter = auth.tenantScope
+          ? env.QUERY_RATE_LIMIT
+          : (env.QUERY_RATE_LIMIT_ADMIN ?? env.QUERY_RATE_LIMIT);
+        const limited = await applyQueryRateLimit(
+          request,
+          env,
+          tenantId!,
+          queryLimiter,
+        );
         if (limited) return limited;
       }
 
@@ -232,15 +262,29 @@ export default {
  *
  * A named entrypoint has no public route, so reaching it proves the caller is
  * a Worker bound to it. That is the only reason the forwarded visitor geo is
- * trusted here: the proxied request carries no `cf` of its own. Nothing else is
- * widened — tenant resolution, the domain allowlist and rate limits apply
- * exactly as on the public endpoint, and only POST /api/collect is served.
+ * trusted here: the proxied request carries no `cf` of its own. The caller must
+ * also forward `CF-Connecting-IP`: without it every visitor would collapse into
+ * one fingerprint and one shared "unknown" quota bucket, so a request missing
+ * it is rejected instead of silently corrupting unique-visitor counts. Nothing
+ * else is widened — tenant resolution, the domain allowlist and rate limits
+ * apply exactly as on the public endpoint, and only POST /api/collect is served.
  */
 export class TenantIngestEntrypoint extends WorkerEntrypoint<Env> {
   override async fetch(request: Request): Promise<Response> {
     const { pathname } = new URL(request.url);
     if (pathname !== "/api/collect" || request.method !== "POST") {
       return publicJsonResponse({ error: "Not Found" }, 404);
+    }
+    const visitorIp = request.headers.get("CF-Connecting-IP")?.trim();
+    if (!visitorIp && this.env.ENVIRONMENT !== "development") {
+      console.error(
+        JSON.stringify({
+          event: "ingest_contract_violation",
+          missing: "cf-connecting-ip",
+          environment: this.env.ENVIRONMENT,
+        }),
+      );
+      return publicJsonResponse({ error: "Missing forwarded visitor IP" }, 400);
     }
     return handleCollect(request, this.env, readForwardedVisitorGeo(request));
   }
@@ -342,7 +386,7 @@ async function handleCollect(
     if (limited) return limited;
   }
 
-  // resolveTenant reads KV (which can fail transiently) and trackEvent runs the
+  // resolveTenant reads KV (which can fail transiently) and trackEvents runs the
   // hash + write; wrap both so a throw returns a CORS-bearing 500 rather than
   // escaping fetch() as a bare 500 with no Access-Control-Allow-Origin header.
   try {
@@ -366,15 +410,20 @@ async function handleCollect(
       events.map((event) =>
         buildCollectEvent({ event, tenantId, isServerToServer }),
       ),
-      forwardedGeo,
+      { forwardedGeo, serverToServer: isServerToServer },
     );
 
     // 204 No Content — minimal response for tracker
     return new Response(null, { status: 204, headers: publicCorsHeaders() });
   } catch (error) {
-    console.error("[Collect] Error:", error);
+    logApiError("/api/collect", error);
     return publicJsonResponse({ error: "Internal server error" }, 500);
   }
+}
+
+/** Strip control characters, then bound a caller-supplied text field. */
+function cleanText(value: string | undefined, maxLength: number): string {
+  return stripControlCharacters(value ?? "").slice(0, maxLength);
 }
 
 function buildCollectEvent({
@@ -404,12 +453,13 @@ function buildCollectEvent({
     eventName: (event.en ?? "").replace(/[^a-zA-Z0-9_\-. ]/g, "").slice(0, 100),
     timeOnPage: Math.max(0, Math.min(event.d ?? 0, 3600)),
     referrer: event.r ?? "",
-    utmSource: (event.us ?? "").slice(0, 200),
-    utmMedium: (event.um ?? "").slice(0, 200),
-    utmCampaign: (event.uc ?? "").slice(0, 200),
+    utmSource: cleanText(event.us, 200),
+    utmMedium: cleanText(event.um, 200),
+    utmCampaign: cleanText(event.uc, 200),
     countryOverride,
-    cityOverride:
-      isServerToServer && event.ci ? event.ci.slice(0, 100) : undefined,
+    cityOverride: isServerToServer
+      ? cleanText(event.ci, 100) || undefined
+      : undefined,
   };
 }
 
@@ -442,10 +492,13 @@ async function applyCollectRateLimit(
   }
 
   try {
+    // Deployed requests always carry CF-Connecting-IP; the sentinel covers
+    // local runs and keeps the key space bounded.
     const ip = request.headers.get("CF-Connecting-IP")?.trim() || "unknown";
     for (let index = 0; index < units; index += 1) {
       const { success } = await limiter.limit({ key: ip });
       if (!success) {
+        logRateLimitTrip("ip");
         return publicJsonResponse({ error: "Too many requests" }, 429);
       }
     }
@@ -479,19 +532,22 @@ async function applySiteCollectRateLimit(
     extractHostname(request.headers.get("Origin")) ??
     extractHostname(request.headers.get("Referer")) ??
     "unknown";
-  return applyPublicRateLimit(
+  const limited = await applyPublicRateLimit(
     env.SITE_COLLECT_RATE_LIMIT,
     [`site:${normalizedSiteId}`, `origin:${origin.toLowerCase()}`],
     env,
     "site_collect_rate_limit",
     units,
   );
+  if (limited?.status === 429) logRateLimitTrip("site");
+  return limited;
 }
 
 async function applyQueryRateLimit(
   request: Request,
   env: Env,
   tenantId: string,
+  limiter: RateLimit | undefined,
 ): Promise<Response | null> {
   const authorization = request.headers.get("Authorization") ?? "";
   const tokenSubject = authorization.startsWith("Bearer ")
@@ -504,7 +560,6 @@ async function applyQueryRateLimit(
   const tokenHash = Array.from(new Uint8Array(digest).slice(0, 16), (byte) =>
     byte.toString(16).padStart(2, "0"),
   ).join("");
-  const limiter = env.QUERY_RATE_LIMIT;
   if (!limiter || typeof limiter.limit !== "function") {
     return rateLimitUnavailable(request, env, "query_rate_limit");
   }
@@ -526,6 +581,33 @@ async function applyQueryRateLimit(
         503,
       );
     }
+  }
+  return null;
+}
+
+/**
+ * Bound failed authentication attempts. They share the query limiter namespace
+ * under an `unauth:` key so token guessing cannot run unbounded. The bucket is
+ * charged only *after* verification fails, so an attacker cannot lock visitors
+ * behind a shared/NAT IP out of their own valid tokens. Best-effort by design:
+ * a missing or failing binding still returns the usual 401 rather than turning
+ * an unrelated limiter outage into 503s for every anonymous caller.
+ */
+async function applyFailedAuthRateLimit(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const limiter = env.QUERY_RATE_LIMIT;
+  if (!limiter || typeof limiter.limit !== "function") return null;
+
+  try {
+    const ip = request.headers.get("CF-Connecting-IP")?.trim() || "unknown";
+    const { success } = await limiter.limit({ key: `unauth:${ip}` });
+    if (!success) {
+      return privateJsonResponse(request, { error: "Too many requests" }, 429);
+    }
+  } catch (error) {
+    logRateLimitFailure(env, "failed_auth_rate_limit", error);
   }
   return null;
 }
@@ -590,6 +672,20 @@ function logRateLimitFailure(env: Env, event: string, error: unknown): void {
       error: error instanceof Error ? error.message.slice(0, 200) : "unknown",
     }),
   );
+}
+
+// Rejected collect requests are cheap to generate, so a trip is logged at most
+// once a minute per scope instead of once per request: the signal stays visible
+// without letting an attacker amplify the log budget.
+const RATE_LIMIT_LOG_INTERVAL_MS = 60_000;
+const lastRateLimitTripAt = new Map<string, number>();
+
+function logRateLimitTrip(scope: "ip" | "site"): void {
+  const now = Date.now();
+  const last = lastRateLimitTripAt.get(scope) ?? 0;
+  if (now - last < RATE_LIMIT_LOG_INTERVAL_MS) return;
+  lastRateLimitTripAt.set(scope, now);
+  console.warn(JSON.stringify({ event: "rate_limit_tripped", scope }));
 }
 
 class PayloadTooLargeError extends Error {}

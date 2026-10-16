@@ -11,6 +11,10 @@ const MOBILE_REGEX =
 /**
  * Parse a User-Agent string into a device type category.
  * Order matters: check tablet first (some tablet UAs contain "Mobile").
+ *
+ * Known limitation: iPadOS 13+ Safari reports a desktop "Macintosh" UA, so those
+ * sessions are classified as Desktop — the UA string alone cannot distinguish
+ * them from a Mac.
  */
 export function parseDeviceType(ua: string): DeviceType {
     if (TABLET_REGEX.test(ua)) return DEVICE_TYPES.TABLET;

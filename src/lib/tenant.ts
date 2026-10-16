@@ -37,7 +37,9 @@ export interface CollectPayload {
 
 // ─── Domain Allowlist Cache ──────────────────────────────────────────────────
 // In-memory cache for KV domain lookups to avoid a KV read on every collect.
-// Resets naturally when the Worker isolate is recycled (every few minutes).
+// Positive entries expire after 5 minutes and negative ones after 30 seconds, so
+// staleness is bounded by those TTLs rather than by isolate lifetime (isolates
+// can live far longer than the "few minutes" they are often recycled within).
 
 const DOMAIN_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const DOMAIN_NEGATIVE_CACHE_TTL_MS = 30 * 1000;
@@ -156,10 +158,6 @@ export function clearDomainCacheForTests(): void {
   negativeDomainCache.clear();
 }
 
-export function getDomainCacheSizeForTests(): number {
-  return positiveDomainCache.size + negativeDomainCache.size;
-}
-
 export function getDomainCacheSizesForTests(): {
   positive: number;
   negative: number;
@@ -225,6 +223,17 @@ export async function resolveTenant(
     if (env.ENVIRONMENT !== "development") {
       const domains = await getCachedDomains(env, siteId);
       if (domains) {
+        // A registered-but-empty list (the last domain was removed, or the sync
+        // registered a tenant with no origins) is an explicit deny-all. It
+        // deliberately does not fall back to the ALLOW_UNREGISTERED_DOMAINS
+        // grace path, which only applies to tenants with no KV entry at all.
+        if (domains.length === 0) {
+          return {
+            tenantId: null,
+            error: "This site has no allowed origins",
+            isServerToServer: false,
+          };
+        }
         if (!normalizedOriginHost || !domains.includes(normalizedOriginHost)) {
           return {
             tenantId: null,

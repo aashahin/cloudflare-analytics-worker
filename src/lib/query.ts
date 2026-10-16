@@ -31,8 +31,8 @@ export class AnalyticsEngineQueryError extends Error {
   readonly status: number;
   readonly rayId: string | null;
 
-  constructor(status: number, rayId: string | null) {
-    super(`Analytics Engine query failed with HTTP ${status}`);
+  constructor(status: number, rayId: string | null, reason?: string) {
+    super(reason ?? `Analytics Engine query failed with HTTP ${status}`);
     this.name = "AnalyticsEngineQueryError";
     this.status = status;
     this.rayId = rayId;
@@ -77,7 +77,9 @@ const QUERY_CACHE_TTL_SECONDS = 60;
 const QUERY_CACHE_TTL_MS = QUERY_CACHE_TTL_SECONDS * 1000;
 const QUERY_CACHE_L1_MAX = 50;
 const QUERY_INFLIGHT_MAX = 100;
-const CACHE_NAMESPACE = "analytics-query-v1";
+// Cache API namespaces live on the zone, so the worker name is part of the
+// namespace to keep these entries from ever overlapping another worker's.
+const CACHE_NAMESPACE = "analytics-query-v1:manhali-analytics";
 const CACHE_ORIGIN = "https://analytics-query.manhali.internal/v1/";
 
 const queryL1 = new Map<string, { expiresAt: number; value: unknown }>();
@@ -89,7 +91,14 @@ function queryCacheHandle(): Promise<Cache> | undefined {
     if (typeof caches === "undefined" || typeof caches.open !== "function") {
       return undefined;
     }
-    cacheHandle ??= caches.open(CACHE_NAMESPACE);
+    if (cacheHandle === undefined) {
+      // A rejected handle must not be memoized: one failed open() would
+      // otherwise disable the colo cache for the isolate's entire lifetime.
+      cacheHandle = caches.open(CACHE_NAMESPACE).catch((error: unknown) => {
+        cacheHandle = undefined;
+        throw error;
+      });
+    }
     return cacheHandle;
   } catch {
     return undefined;
@@ -202,11 +211,10 @@ export function clearAnalyticsQueryCache(): void {
   cacheHandle = undefined;
 }
 
-export function clearDashboardSectionsCache(): void {
-  clearAnalyticsQueryCache();
-}
-
 // ─── SQL API Client ──────────────────────────────────────────────────────────
+
+/** Hard ceiling per upstream call: keeps a stalled SQL API from chaining waits. */
+const SQL_API_TIMEOUT_MS = 10_000;
 
 async function fetchAnalyticsEngine(
   env: Env,
@@ -214,13 +222,28 @@ async function fetchAnalyticsEngine(
 ): Promise<AnalyticsEngineResponse> {
   const endpoint = `https://api.cloudflare.com/client/v4/accounts/${env.ACCOUNT_ID}/analytics_engine/sql`;
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${env.CF_API_TOKEN}`,
-    },
-    body: sql,
-  });
+  let response: Response;
+  try {
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.CF_API_TOKEN}`,
+      },
+      body: sql,
+      signal: AbortSignal.timeout(SQL_API_TIMEOUT_MS),
+    });
+  } catch (error) {
+    // A timeout is reported like any other upstream failure so /api/sections
+    // degrades section-by-section and the API returns a classified error.
+    if (error instanceof Error && error.name === "TimeoutError") {
+      throw new AnalyticsEngineQueryError(
+        0,
+        null,
+        `Analytics Engine query timed out after ${SQL_API_TIMEOUT_MS}ms`,
+      );
+    }
+    throw error;
+  }
 
   if (!response.ok) {
     // Provider bodies are intentionally neither retained nor logged: an

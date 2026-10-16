@@ -1196,6 +1196,162 @@ describe("collect endpoint", () => {
     expect(siteLimiter.keys).toHaveLength(0);
     expect(dataPoints).toHaveLength(0);
   });
+
+  it("records authenticated server-to-server events sent with a library user agent", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints);
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer ingest-secret",
+          "User-Agent": "undici",
+          "CF-Connecting-IP": "203.0.113.80",
+        },
+        body: JSON.stringify({ t: "pageview", p: "/", tid: "tenant_backend" }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(204);
+    expect(dataPoints).toHaveLength(1);
+    expect(dataPoints[0]?.indexes?.[0]).toBe("tenant_backend");
+  });
+
+  it("still drops bot user agents on the public collect path", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints);
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/plain;charset=UTF-8",
+          Origin: "https://example.com",
+          "User-Agent": "curl/8.4.0",
+          "CF-Connecting-IP": "203.0.113.81",
+        },
+        body: JSON.stringify({ t: "pageview", p: "/", sid: "tenant_1" }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(204);
+    expect(dataPoints).toHaveLength(0);
+  });
+
+  it("rejects service-binding collects that do not forward the visitor IP", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const request = proxiedBeacon();
+    request.headers.delete("CF-Connecting-IP");
+
+    const response = await ingestEntrypoint(createMockEnv(dataPoints)).fetch(
+      request,
+    );
+
+    expect(response.status).toBe(400);
+    expect(dataPoints).toHaveLength(0);
+  });
+
+  it("allows service-binding collects without a forwarded IP in development", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const request = proxiedBeacon(undefined, {});
+    request.headers.delete("CF-Connecting-IP");
+
+    const response = await ingestEntrypoint({
+      ...createMockEnv(dataPoints),
+      ENVIRONMENT: "development",
+    }).fetch(request);
+
+    expect(response.status).toBe(204);
+    expect(dataPoints).toHaveLength(1);
+  });
+
+  it("fails closed when FINGERPRINT_SECRET is missing", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = { ...createMockEnv(dataPoints), FINGERPRINT_SECRET: "" };
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: { Origin: "https://example.com", "User-Agent": browserUa },
+        body: JSON.stringify({ t: "pageview", p: "/", sid: "tenant_1" }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(500);
+    expect(dataPoints).toHaveLength(0);
+  });
+
+  it("strips control characters from paths, UTM fields, and server-to-server cities", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints);
+
+    const response = await worker.fetch(
+      new Request("https://analytics.example.com/api/collect", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer ingest-secret",
+          "CF-Connecting-IP": "203.0.113.83",
+        },
+        body: JSON.stringify({
+          t: "pageview",
+          p: "/courses\n\u0000\t",
+          tid: "tenant_clean",
+          us: "news\u0007letter",
+          um: "em\u0000ail",
+          uc: "camp\u001faign",
+          ci: "Cai\u0000ro",
+        }),
+      }),
+      env,
+    );
+
+    expect(response.status).toBe(204);
+    const blobs = dataPoints[0]?.blobs ?? [];
+    expect(blobs[1]).toBe("/courses");
+    expect(blobs[4]).toBe("Cairo");
+    expect(blobs[7]).toBe("newsletter");
+    expect(blobs[8]).toBe("email");
+    expect(blobs[9]).toBe("campaign");
+  });
+
+  it("logs at most one rate-limit trip per scope per window", async () => {
+    const originalWarn = console.warn;
+    const logged: string[] = [];
+    console.warn = (...args: unknown[]) => {
+      logged.push(String(args[0]));
+    };
+    try {
+      const env = createMockEnv([], {
+        rateLimit: createFakeRateLimiter({ success: false }),
+      });
+      const request = () =>
+        new Request("https://analytics.example.com/api/collect", {
+          method: "POST",
+          headers: {
+            Origin: "https://example.com",
+            "User-Agent": browserUa,
+            "CF-Connecting-IP": "203.0.113.84",
+          },
+          body: JSON.stringify({ t: "pageview", p: "/", sid: "tenant_1" }),
+        });
+
+      expect((await worker.fetch(request(), env)).status).toBe(429);
+      expect((await worker.fetch(request(), env)).status).toBe(429);
+
+      const trips = logged.filter((line) =>
+        line.includes("rate_limit_tripped"),
+      );
+      expect(trips.length).toBeLessThanOrEqual(1);
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
 });
 
 describe("tracker script", () => {
@@ -1214,6 +1370,15 @@ describe("tracker script", () => {
     );
 
     expect(script).toContain("events:[previous,next]");
+  });
+
+  it("serves a script that parses as JavaScript", () => {
+    const script = getTrackerScript(
+      "https://analytics.example.com/api/collect",
+      "tenant_1",
+    );
+
+    expect(() => new Function(script)).not.toThrow();
   });
 });
 
@@ -1267,6 +1432,238 @@ describe("domain allowlist on collect", () => {
     expect(res.status).toBe(204);
     expect(dataPoints).toHaveLength(1);
   });
+
+  it("treats a registered-but-empty allowlist as deny-all", async () => {
+    const dataPoints: AnalyticsEngineDataPoint[] = [];
+    const env = createMockEnv(dataPoints, {
+      domains: [],
+      allowUnregistered: "true",
+    });
+    const res = await collect(env, "https://example.com", "empty_tenant");
+    expect(res.status).toBe(400);
+    await expect(res.json()).resolves.toMatchObject({
+      error: "This site has no allowed origins",
+    });
+    expect(dataPoints).toHaveLength(0);
+  });
+});
+
+// ─── Authenticated API Surface ───────────────────────────────────────────────
+
+describe("authenticated API surface", () => {
+  it("marks private responses no-store", async () => {
+    const env = createMockEnv([]);
+    const allowed = await worker.fetch(
+      new Request(
+        "https://analytics.example.com/api/admin/domains?tenant_id=tenant_1",
+        { headers: { Authorization: "Bearer admin-secret" } },
+      ),
+      env,
+    );
+    const denied = await worker.fetch(
+      new Request(
+        "https://analytics.example.com/api/admin/domains?tenant_id=tenant_1",
+      ),
+      env,
+    );
+
+    expect(allowed.status).toBe(200);
+    expect(allowed.headers.get("Cache-Control")).toBe("no-store");
+    expect(denied.status).toBe(401);
+    expect(denied.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("answers known paths reached with the wrong method with 405 and Allow", async () => {
+    const env = createMockEnv([]);
+    const cases: Array<{ request: Request; allow: string }> = [
+      {
+        request: new Request("https://analytics.example.com/api/collect"),
+        allow: "POST",
+      },
+      {
+        request: new Request("https://analytics.example.com/health", {
+          method: "POST",
+        }),
+        allow: "GET, HEAD",
+      },
+      {
+        request: new Request("https://analytics.example.com/tracker.js", {
+          method: "POST",
+        }),
+        allow: "GET, HEAD",
+      },
+      {
+        request: new Request(
+          "https://analytics.example.com/api/overview?tenant_id=tenant_1",
+          {
+            method: "POST",
+            headers: { Authorization: "Bearer admin-secret" },
+          },
+        ),
+        allow: "GET, HEAD",
+      },
+      {
+        request: new Request("https://analytics.example.com/api/admin/token", {
+          headers: { Authorization: "Bearer admin-secret" },
+        }),
+        allow: "POST",
+      },
+    ];
+
+    for (const { request, allow } of cases) {
+      const response = await worker.fetch(request, env);
+      expect(response.status).toBe(405);
+      expect(response.headers.get("Allow")).toBe(allow);
+    }
+  });
+
+  it("routes each token type through its own query limiter", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ data: [] }), {
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+    try {
+      const scopedToken = await createScopedToken(
+        "admin-secret",
+        "tenant_1",
+        3600,
+      );
+      const scopedThrottled = createMockEnv([], {
+        queryRateLimit: createFakeRateLimiter({ success: false }),
+        adminQueryRateLimit: createFakeRateLimiter(),
+      });
+      const adminThrottled = createMockEnv([], {
+        queryRateLimit: createFakeRateLimiter(),
+        adminQueryRateLimit: createFakeRateLimiter({ success: false }),
+      });
+      const query = (env: Env, token: string) =>
+        worker.fetch(
+          new Request(
+            "https://analytics.example.com/api/overview?tenant_id=tenant_1",
+            { headers: { Authorization: `Bearer ${token}` } },
+          ),
+          env,
+        );
+
+      expect((await query(scopedThrottled, scopedToken)).status).toBe(429);
+      expect(
+        (await query(scopedThrottled, scopedThrottled.AUTH_TOKEN)).status,
+      ).toBe(200);
+      expect(
+        (await query(adminThrottled, adminThrottled.AUTH_TOKEN)).status,
+      ).toBe(429);
+      expect((await query(adminThrottled, scopedToken)).status).toBe(200);
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearAnalyticsQueryCache();
+    }
+  });
+
+  it("throttles failed authentication attempts", async () => {
+    const request = () =>
+      new Request(
+        "https://analytics.example.com/api/overview?tenant_id=tenant_1",
+        {
+          headers: {
+            Authorization: "Bearer wrong-token",
+            "CF-Connecting-IP": "203.0.113.90",
+          },
+        },
+      );
+    const quotaAvailable = createMockEnv([], {
+      queryRateLimit: createFakeRateLimiter(),
+    });
+    const quotaExhausted = createMockEnv([], {
+      queryRateLimit: createFakeRateLimiter({ success: false }),
+    });
+
+    expect((await worker.fetch(request(), quotaAvailable)).status).toBe(401);
+    expect((await worker.fetch(request(), quotaExhausted)).status).toBe(429);
+  });
+
+  it("classifies an upstream SQL timeout as an Analytics Engine query failure", async () => {
+    const originalFetch = globalThis.fetch;
+    const originalConsoleError = console.error;
+    const logged: string[] = [];
+    globalThis.fetch = (async () => {
+      throw Object.assign(new Error("The operation was aborted"), {
+        name: "TimeoutError",
+      });
+    }) as typeof fetch;
+    console.error = (...args: unknown[]) => {
+      logged.push(String(args[0]));
+    };
+    try {
+      const response = await worker.fetch(
+        new Request(
+          "https://analytics.example.com/api/realtime?tenant_id=tenant_timeout",
+          { headers: { Authorization: "Bearer admin-secret" } },
+        ),
+        createMockEnv([]),
+      );
+
+      expect(response.status).toBe(500);
+      expect(JSON.parse(logged[0] ?? "{}")).toMatchObject({
+        event: "analytics_api_request_failed",
+        path: "/api/realtime",
+        errorName: "AnalyticsEngineQueryError",
+        upstreamStatus: 0,
+        upstreamRayId: null,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      console.error = originalConsoleError;
+      clearAnalyticsQueryCache();
+    }
+  });
+});
+
+// ─── Admin Domain Management ─────────────────────────────────────────────────
+
+describe("admin domain management", () => {
+  it("serializes concurrent domain writes so neither add is lost", async () => {
+    const store = new Map<string, string>();
+    const kv = {
+      get: async (key: string) => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return store.get(key) ?? null;
+      },
+      put: async (key: string, value: string) => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        store.set(key, value);
+      },
+    } as unknown as KVNamespace;
+    const env = { ...createMockEnv([]), DOMAINS_KV: kv };
+
+    const addDomain = (domain: string) =>
+      worker.fetch(
+        new Request(
+          "https://analytics.example.com/api/admin/domains?tenant_id=tenant_locked",
+          {
+            method: "POST",
+            headers: {
+              Authorization: "Bearer admin-secret",
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ domain }),
+          },
+        ),
+        env,
+      );
+
+    const [first, second] = await Promise.all([
+      addDomain("first.example.com"),
+      addDomain("second.example.com"),
+    ]);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(JSON.parse(store.get("domains:tenant_locked") ?? "[]")).toEqual([
+      "first.example.com",
+      "second.example.com",
+    ]);
+  });
 });
 
 const browserUa =
@@ -1279,6 +1676,7 @@ interface MockEnvOptions {
   rateLimit?: FakeRateLimiter;
   siteRateLimit?: FakeRateLimiter;
   queryRateLimit?: FakeRateLimiter;
+  adminQueryRateLimit?: FakeRateLimiter;
 }
 
 interface FakeRateLimiter extends RateLimit {
@@ -1325,6 +1723,7 @@ function createMockEnv(
     SITE_COLLECT_RATE_LIMIT:
       opts.siteRateLimit ?? createFakeRateLimiter(),
     QUERY_RATE_LIMIT: opts.queryRateLimit ?? createFakeRateLimiter(),
+    QUERY_RATE_LIMIT_ADMIN: opts.adminQueryRateLimit,
     AUTH_TOKEN: "admin-secret",
     CF_API_TOKEN: "cf-secret",
     FINGERPRINT_SECRET: "fingerprint-secret",
