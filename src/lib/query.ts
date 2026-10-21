@@ -269,6 +269,45 @@ async function queryAnalyticsEngine(
   return withCachedResult(`sql:${sql}`, () => fetchAnalyticsEngine(env, sql));
 }
 
+type Settled<L extends readonly (() => Promise<unknown>)[]> = {
+  -readonly [K in keyof L]: PromiseSettledResult<Awaited<ReturnType<L[K]>>>;
+};
+
+/**
+ * A status that can clear on its own: the SQL API's rate limit (429) or a
+ * server-side failure. A timeout (status 0) and other 4xx answers are final,
+ * since a second attempt would wait as long again or fail the same way.
+ */
+function isTransient(reason: unknown): boolean {
+  return (
+    reason instanceof AnalyticsEngineQueryError &&
+    (reason.status === 429 || reason.status >= 500)
+  );
+}
+
+/**
+ * Run independent queries together. A query that failed transiently is re-run
+ * once, alone, after the burst has settled, so a cold burst costs latency and
+ * never data. Any other failure is reported as is.
+ */
+async function settleIndependent<
+  const L extends readonly (() => Promise<unknown>)[],
+>(loads: L): Promise<Settled<L>> {
+  const results = await Promise.allSettled(loads.map((load) => load()));
+  for (const [index, result] of results.entries()) {
+    if (result.status === "rejected" && isTransient(result.reason)) {
+      results[index] = (await Promise.allSettled([loads[index]!()]))[0]!;
+    }
+  }
+  // The array holds one result per load, in order; TS cannot see that.
+  return results as unknown as Settled<L>;
+}
+
+function valueOf<T>(result: PromiseSettledResult<T>): T {
+  if (result.status === "rejected") throw result.reason;
+  return result.value;
+}
+
 // ─── Pre-built Queries ───────────────────────────────────────────────────────
 
 /**
@@ -503,11 +542,14 @@ export async function getRealtime(
     LIMIT 10
   `;
 
-    // Keep the exact two-query contract, but do not burst both SQL API calls at
-    // once. Analytics Engine may transiently reject concurrent cold queries;
-    // sequencing adds no retry or fan-out and preserves exact visitor counts.
-    const totalResult = await queryAnalyticsEngine(env, totalSql);
-    const pagesResult = await queryAnalyticsEngine(env, pagesSql);
+    // Same two-query contract; the queries are independent, so they run
+    // together (see settleIndependent for the overload fallback).
+    const [totalSettled, pagesSettled] = await settleIndependent([
+      () => queryAnalyticsEngine(env, totalSql),
+      () => queryAnalyticsEngine(env, pagesSql),
+    ]);
+    const totalResult = valueOf(totalSettled);
+    const pagesResult = valueOf(pagesSettled);
 
     return {
       currentVisitors: Number(totalResult.data[0]?.current_visitors ?? 0),
@@ -590,23 +632,20 @@ export async function getDashboardSections(
   return withCachedResult(
     `sections:${dataset}:${tenantId}:${days}:${limit}`,
     async () => {
-      // Same five-query contract as before, sequenced so Analytics Engine is
-      // not hit with a concurrent cold burst (see getRealtime).
-      const pages = await settleSection("pages", () =>
-        getTopPages(env, tenantId, days, limit),
-      );
-      const referrers = await settleSection("referrers", () =>
-        getTopReferrers(env, tenantId, days, limit),
-      );
-      const geo = await settleSection("geo", () =>
-        getGeoBreakdown(env, tenantId, days),
-      );
-      const devices = await settleSection("devices", () =>
-        getDeviceBreakdown(env, tenantId, days),
-      );
-      const events = await settleSection("events", () =>
-        getCustomEvents(env, tenantId, days, limit),
-      );
+      // Same five-query contract as before, issued together (see
+      // settleIndependent for the overload fallback).
+      const [pages, referrers, geo, devices, events] = await settleIndependent([
+        () => getTopPages(env, tenantId, days, limit),
+        () => getTopReferrers(env, tenantId, days, limit),
+        () => getGeoBreakdown(env, tenantId, days),
+        () => getDeviceBreakdown(env, tenantId, days),
+        () => getCustomEvents(env, tenantId, days, limit),
+      ]);
+      logSectionFailure("pages", pages);
+      logSectionFailure("referrers", referrers);
+      logSectionFailure("geo", geo);
+      logSectionFailure("devices", devices);
+      logSectionFailure("events", events);
       return {
         pages: pages.status === "fulfilled" ? pages.value : [],
         referrers: referrers.status === "fulfilled" ? referrers.value : [],
@@ -626,39 +665,36 @@ export async function getDashboardSections(
   );
 }
 
-async function settleSection<T>(
+function logSectionFailure(
   section: keyof DashboardSectionErrors,
-  load: () => Promise<T>,
-): Promise<PromiseSettledResult<T>> {
-  try {
-    return { status: "fulfilled", value: await load() };
-  } catch (reason) {
-    const common = {
-      event: "analytics_section_query_failed",
-      section,
-      errorName: reason instanceof Error ? reason.name : "UnknownError",
-    };
-    if (reason instanceof AnalyticsEngineQueryError) {
-      console.error(
-        JSON.stringify({
-          ...common,
-          upstream: "analytics_engine_sql_api",
-          upstreamStatus: reason.status,
-          upstreamRayId: reason.rayId,
-        }),
-      );
-    } else {
-      console.error(
-        JSON.stringify({
-          ...common,
-          error:
-            reason instanceof Error
-              ? reason.message.slice(0, 512)
-              : String(reason).slice(0, 512),
-        }),
-      );
-    }
-    return { status: "rejected", reason };
+  result: PromiseSettledResult<unknown>,
+): void {
+  if (result.status === "fulfilled") return;
+  const reason = result.reason;
+  const common = {
+    event: "analytics_section_query_failed",
+    section,
+    errorName: reason instanceof Error ? reason.name : "UnknownError",
+  };
+  if (reason instanceof AnalyticsEngineQueryError) {
+    console.error(
+      JSON.stringify({
+        ...common,
+        upstream: "analytics_engine_sql_api",
+        upstreamStatus: reason.status,
+        upstreamRayId: reason.rayId,
+      }),
+    );
+  } else {
+    console.error(
+      JSON.stringify({
+        ...common,
+        error:
+          reason instanceof Error
+            ? reason.message.slice(0, 512)
+            : String(reason).slice(0, 512),
+      }),
+    );
   }
 }
 

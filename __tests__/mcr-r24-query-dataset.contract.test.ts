@@ -52,6 +52,46 @@ function emptyEngineResponse(): Response {
   );
 }
 
+/**
+ * Holds each caller until `parties` have arrived, so a test sees concurrency
+ * without timing. A caller that never gets company is released after a short
+ * wait, which lets the test fail on its count instead of hanging.
+ */
+function barrier(parties: number): () => Promise<void> {
+  let arrived = 0;
+  let release!: () => void;
+  const open = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const fallback = setTimeout(release, 250);
+  return async () => {
+    arrived += 1;
+    if (arrived >= parties) {
+      clearTimeout(fallback);
+      release();
+    }
+    await open;
+  };
+}
+
+function realtimeData(sql: string): Record<string, string>[] {
+  return sql.includes("AS current_visitors")
+    ? [{ current_visitors: "3" }]
+    : [{ page_path: "/courses", visitors: "2" }];
+}
+
+function engineResponse(data: Record<string, string>[]): Response {
+  return new Response(
+    JSON.stringify({
+      data,
+      rows: data.length,
+      rows_before_limit_at_least: 0,
+      meta: [],
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
 function captureSql(env: Env): { sql: string[]; restore: () => void } {
   const sql: string[] = [];
   globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
@@ -153,8 +193,9 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
     }
   });
 
-  it("does not overlap the two realtime Analytics Engine SQL requests", async () => {
+  it("issues the two independent realtime Analytics Engine SQL requests together", async () => {
     const env = createQueryEnv(SANDBOX_DATASET);
+    const together = barrier(2);
     let active = 0;
     let maxActive = 0;
     let calls = 0;
@@ -166,42 +207,77 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
       calls += 1;
       active += 1;
       maxActive = Math.max(maxActive, active);
-      const sql = String(init?.body ?? "");
-
-      // Model the transient upstream rejection observed when cold realtime
-      // queries overlap. The production fix must avoid the overlap, not retry.
-      await Promise.resolve();
-      const overloaded = active > 1;
+      await together();
       active -= 1;
-      if (overloaded) {
-        return new Response("too many concurrent analytics queries", {
-          status: 429,
-          headers: { "cf-ray": "test-ray" },
-        });
-      }
-
-      const data = sql.includes("AS current_visitors")
-        ? [{ current_visitors: "3" }]
-        : [{ page_path: "/courses", visitors: "2" }];
-      return new Response(
-        JSON.stringify({
-          data,
-          rows: data.length,
-          rows_before_limit_at_least: 0,
-          meta: [],
-        }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
+      return engineResponse(realtimeData(String(init?.body ?? "")));
     }) as typeof fetch;
 
-    const result = await getRealtime(env, "tenant_realtime_sequential");
+    const result = await getRealtime(env, "tenant_realtime_parallel");
 
     expect(calls).toBe(2);
-    expect(maxActive).toBe(1);
+    expect(maxActive).toBe(2);
     expect(result).toEqual({
       currentVisitors: 3,
       topPages: [{ pagePath: "/courses", visitors: 2 }],
     });
+  });
+
+  it.each([429, 503])(
+    "re-runs a request that failed with HTTP %d after the burst, one at a time",
+    async (status) => {
+      const env = createQueryEnv(SANDBOX_DATASET);
+      const together = barrier(2);
+      let active = 0;
+      let maxActiveRetry = 0;
+      let calls = 0;
+      let burstSettled = false;
+
+      globalThis.fetch = (async (
+        _input: RequestInfo | URL,
+        init?: RequestInit,
+      ) => {
+        calls += 1;
+        active += 1;
+        const inBurst = !burstSettled;
+        if (!inBurst) maxActiveRetry = Math.max(maxActiveRetry, active);
+        const sql = String(init?.body ?? "");
+        // The first caller of the burst is turned away while both are in flight.
+        const overloaded = inBurst && sql.includes("AS current_visitors");
+        if (inBurst) await together();
+        active -= 1;
+        if (inBurst && active === 0) burstSettled = true;
+        if (overloaded) {
+          return new Response("too many concurrent analytics queries", {
+            status,
+            headers: { "cf-ray": "test-ray" },
+          });
+        }
+        return engineResponse(realtimeData(sql));
+      }) as typeof fetch;
+
+      const result = await getRealtime(env, "tenant_realtime_overloaded");
+
+      expect(calls).toBe(3);
+      expect(maxActiveRetry).toBe(1);
+      expect(result).toEqual({
+        currentVisitors: 3,
+        topPages: [{ pagePath: "/courses", visitors: 2 }],
+      });
+    },
+  );
+
+  it("does not retry a failure that cannot clear on its own", async () => {
+    const env = createQueryEnv(SANDBOX_DATASET);
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return new Response("bad query", { status: 400 });
+    }) as typeof fetch;
+
+    await expect(getRealtime(env, "tenant_realtime_broken")).rejects.toThrow(
+      "HTTP 400",
+    );
+    expect(calls).toBe(2);
   });
 
   it("production default stays manhali_analytics when ANALYTICS_DATASET is unset", async () => {
@@ -312,6 +388,83 @@ describe("MCR-R24 / MCR-003 analytics query dataset", () => {
 
     captured.restore();
     clearAnalyticsQueryCache();
+  });
+
+  it("dashboard sections run their five independent queries together", async () => {
+    const env = createQueryEnv(SANDBOX_DATASET);
+    const together = barrier(5);
+    let active = 0;
+    let maxActive = 0;
+    globalThis.fetch = (async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await together();
+      active -= 1;
+      return emptyEngineResponse();
+    }) as typeof fetch;
+
+    const sections = await getDashboardSections(env, "tenant_parallel", 7, 10);
+
+    expect(maxActive).toBe(5);
+    expect(Object.values(sections.errors).some(Boolean)).toBe(false);
+  });
+
+  /** Answers every section query, failing the geo one `failures` times. */
+  function geoFailing(failures: number): { calls: () => number } {
+    let geoCalls = 0;
+    let failed = 0;
+    globalThis.fetch = (async (
+      _input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const sql = String(init?.body ?? "");
+      if (/\bcountry\b/i.test(sql)) {
+        geoCalls += 1;
+        if (failed < failures) {
+          failed += 1;
+          return new Response("slow down", { status: 429 });
+        }
+      }
+      return emptyEngineResponse();
+    }) as typeof fetch;
+    return { calls: () => geoCalls };
+  }
+
+  it("a section rejected once as overloaded is re-run and reports no error", async () => {
+    const env = createQueryEnv(SANDBOX_DATASET);
+    const logged: string[] = [];
+    const originalError = console.error;
+    console.error = (line: unknown) => logged.push(String(line));
+    try {
+      const geo = geoFailing(1);
+      const sections = await getDashboardSections(env, "tenant_geo_once", 7, 10);
+
+      expect(geo.calls()).toBe(2);
+      expect(sections.errors.geo).toBe(false);
+      expect(logged).toEqual([]);
+    } finally {
+      console.error = originalError;
+    }
+  });
+
+  it("a section still rejected after its re-run reports the error and is not cached", async () => {
+    const env = createQueryEnv(SANDBOX_DATASET);
+    const originalError = console.error;
+    const logged: string[] = [];
+    console.error = (line: unknown) => logged.push(String(line));
+    try {
+      const geo = geoFailing(2);
+      const first = await getDashboardSections(env, "tenant_geo_twice", 7, 10);
+
+      expect(geo.calls()).toBe(2);
+      expect(first.errors.geo).toBe(true);
+      expect(logged).toHaveLength(1);
+
+      const second = await getDashboardSections(env, "tenant_geo_twice", 7, 10);
+      expect(second.errors.geo).toBe(false);
+    } finally {
+      console.error = originalError;
+    }
   });
 
   it("getOverview is one SQL with unique visitors and avg time, not top pages", async () => {
