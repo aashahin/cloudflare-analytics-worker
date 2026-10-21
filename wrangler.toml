@@ -109,8 +109,8 @@ routes = [
 ]
 
 [env.sandbox.limits]
-# The Sandbox account uses Workers Free, which rejects any explicit CPU limit.
-# Keep this empty to override the inheritable paid-production limit above.
+# The sandbox account is on Workers Paid. Keep this empty so the sandbox drops
+# the inheritable production CPU limit above and the platform default applies.
 
 [[env.sandbox.analytics_engine_datasets]]
 binding = "ANALYTICS"
