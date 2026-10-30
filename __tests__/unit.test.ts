@@ -12,6 +12,7 @@ import worker, {
 import type { Env } from "../src/env.ts";
 import {
   createScopedToken,
+  deriveScopedTokenKey,
   timingSafeEqual,
   verifyAuth,
   verifyIngestAuth,
@@ -549,18 +550,64 @@ describe("auth guards", () => {
     const bearer = (token: string) => new Request("https://analytics.example.com/api/overview", {
       headers: { Authorization: `Bearer ${token}` },
     });
-    for (const secret of [overlap.AUTH_TOKEN, overlap.AUTH_TOKEN_PREVIOUS]) {
-      expect(await verifyAuth(bearer(secret), overlap)).toEqual({ authenticated: true });
+    for (const [secret, credential] of [
+      [overlap.AUTH_TOKEN, "current"],
+      [overlap.AUTH_TOKEN_PREVIOUS, "previous"],
+    ] as const) {
+      expect(await verifyAuth(bearer(secret), overlap)).toEqual({ authenticated: true, credential });
       expect(await verifyIngestAuth(bearer(secret), overlap)).toBe(true);
     }
     const scoped = await createScopedToken(overlap.AUTH_TOKEN_PREVIOUS, "tenant_42", 3600);
-    expect(await verifyAuth(bearer(scoped), overlap)).toEqual({ authenticated: true, tenantScope: "tenant_42" });
+    expect(await verifyAuth(bearer(scoped), overlap)).toEqual({ authenticated: true, tenantScope: "tenant_42", credential: "scoped" });
     expect(await verifyAuth(bearer(overlap.AUTH_TOKEN_PREVIOUS), current)).toEqual({ authenticated: false });
     expect(await verifyIngestAuth(bearer(overlap.AUTH_TOKEN_PREVIOUS), current)).toBe(false);
     expect(await verifyAuth(bearer(scoped), current)).toEqual({ authenticated: false });
-    expect(await verifyAuth(bearer(current.AUTH_TOKEN), current)).toEqual({ authenticated: true });
+    expect(await verifyAuth(bearer(current.AUTH_TOKEN), current)).toEqual({ authenticated: true, credential: "current" });
     expect(await verifyIngestAuth(bearer(overlap.AUTH_TOKEN_PREVIOUS), { ...overlap, INGEST_TOKEN: "separate-ingest" })).toBe(false);
   });
+  it("refuses the previous admin token on admin routes, so it cannot mint a current-signed scoped token", async () => {
+    const current = { ...createMockEnv([]), AUTH_TOKEN: "new-admin-secret", INGEST_TOKEN: undefined };
+    const overlap = { ...current, AUTH_TOKEN_PREVIOUS: "old-admin-secret" };
+    const bearerRequest = (token: string) =>
+      new Request("https://analytics.example.com/api/overview", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    const mint = (env: Env, token: string) =>
+      worker.fetch(
+        new Request("https://analytics.example.com/api/admin/token", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ tenant_id: "tenant_42" }),
+        }),
+        env,
+      );
+
+    const denied = await mint(overlap, overlap.AUTH_TOKEN_PREVIOUS);
+    expect(denied.status).toBe(403);
+    expect(await denied.text()).not.toContain("scoped:");
+    const deniedDomains = await worker.fetch(
+      new Request("https://analytics.example.com/api/admin/domains?tenant_id=tenant_42", {
+        headers: { Authorization: `Bearer ${overlap.AUTH_TOKEN_PREVIOUS}` },
+      }),
+      overlap,
+    );
+    expect(deniedDomains.status).toBe(403);
+
+    const allowed = await mint(overlap, overlap.AUTH_TOKEN);
+    expect(allowed.status).toBe(200);
+    const minted = (await allowed.json()) as { token: string; tenant_id: string };
+    expect(minted.tenant_id).toBe("tenant_42");
+
+    // Removing the previous binding revokes the retired admin token, but the
+    // token the current admin minted stays valid for its tenant.
+    expect((await mint(current, overlap.AUTH_TOKEN_PREVIOUS)).status).toBe(401);
+    await expect(verifyAuth(bearerRequest(minted.token), current)).resolves.toEqual({
+      authenticated: true,
+      tenantScope: "tenant_42",
+      credential: "scoped",
+    });
+  });
+
   it("rejects blank bearer tokens before comparing secrets", async () => {
     const env = createMockEnv([]);
     const request = new Request("https://analytics.example.com/api/overview", {
@@ -613,6 +660,7 @@ describe("scoped tokens", () => {
     await expect(verifyAuth(bearer(token), env)).resolves.toEqual({
       authenticated: true,
       tenantScope: "tenant_42",
+      credential: "scoped",
     });
   });
 
@@ -647,6 +695,35 @@ describe("scoped tokens", () => {
     await expect(verifyAuth(bearer(token), env)).resolves.toEqual({
       authenticated: true,
       tenantScope: "org:team:1",
+      credential: "scoped",
+    });
+  });
+
+  it("signs with a key derived from AUTH_TOKEN, not the admin bearer secret itself", async () => {
+    const env = createMockEnv([]);
+    const token = await createScopedToken(env.AUTH_TOKEN, "tenant_42", 3600);
+    const [payload, providedHmac] = [token.slice(0, token.lastIndexOf(":")), token.slice(token.lastIndexOf(":") + 1)];
+    const hmacHex = async (secret: string) => {
+      const encoder = new TextEncoder();
+      const key = await crypto.subtle.importKey(
+        "raw",
+        encoder.encode(secret),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"],
+      );
+      const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(payload));
+      return Array.from(new Uint8Array(signature), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    };
+
+    const derivedKey = await deriveScopedTokenKey(env.AUTH_TOKEN);
+    expect(derivedKey).not.toBe(env.AUTH_TOKEN);
+    expect(await hmacHex(derivedKey)).toBe(providedHmac);
+    // The raw bearer secret is no longer a valid signing key, so the token cannot
+    // serve as an offline oracle for the admin credential.
+    expect(await hmacHex(env.AUTH_TOKEN)).not.toBe(providedHmac);
+    await expect(verifyAuth(bearer(`${payload}:${await hmacHex(env.AUTH_TOKEN)}`), env)).resolves.toEqual({
+      authenticated: false,
     });
   });
 });

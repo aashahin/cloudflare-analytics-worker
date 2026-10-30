@@ -83,6 +83,12 @@ export interface AuthResult {
   authenticated: boolean;
   /** If set, the token is scoped to this tenant only (non-admin) */
   tenantScope?: string;
+  /**
+   * Which credential matched. `previous` is the rotation-overlap admin token:
+   * it may query analytics, but admin routes reject it so it cannot mint a
+   * current-signed scoped token or make a persistent admin mutation.
+   */
+  credential?: "current" | "previous" | "scoped";
 }
 
 export async function verifyAuth(
@@ -93,17 +99,23 @@ export async function verifyAuth(
   const authSecret = configuredSecret(env.AUTH_TOKEN, "AUTH_TOKEN");
   if (!token || !authSecret) return { authenticated: false };
   const previousSecret = optionalConfiguredSecret(env.AUTH_TOKEN_PREVIOUS, "AUTH_TOKEN_PREVIOUS");
-  const acceptedSecrets = previousSecret ? [authSecret, previousSecret] : [authSecret];
 
-  // Admin token — unrestricted access to all tenants
-  if ((await Promise.all(acceptedSecrets.map(secret => timingSafeEqual(token, secret)))).some(Boolean)) {
-    return { authenticated: true };
+  // Admin token — unrestricted access to all tenants. The match is reported so
+  // the admin surface can refuse the previous (rotating-out) credential.
+  if (await timingSafeEqual(token, authSecret)) {
+    return { authenticated: true, credential: "current" };
+  }
+  if (previousSecret && (await timingSafeEqual(token, previousSecret))) {
+    return { authenticated: true, credential: "previous" };
   }
 
-  // Scoped token — restricted to a single tenant
-  const scoped = (await Promise.all(acceptedSecrets.map(secret => verifyScopedToken(token, secret)))).find(Boolean);
+  // Scoped token — restricted to a single tenant. Both accepted secrets are
+  // tried so tokens minted before the rotation keep working during overlap.
+  const scoped =
+    (await verifyScopedToken(token, authSecret)) ??
+    (previousSecret ? await verifyScopedToken(token, previousSecret) : null);
   if (scoped) {
-    return { authenticated: true, tenantScope: scoped.tenantId };
+    return { authenticated: true, tenantScope: scoped.tenantId, credential: "scoped" };
   }
 
   return { authenticated: false };
@@ -131,6 +143,18 @@ export async function verifyIngestAuth(
 // Purely cryptographic — no KV lookup needed for verification.
 
 const hmacEncoder = new TextEncoder();
+
+/**
+ * Domain separation for the scoped-token key. A scoped token exposes its
+ * payload and HMAC, so signing with the admin bearer secret itself would let a
+ * tenant-scoped holder test candidate admin tokens offline. The derived key
+ * keeps the bearer and the signing key independent.
+ */
+const SCOPED_TOKEN_KEY_CONTEXT = "manhali:analytics:scoped-token:v1";
+
+export async function deriveScopedTokenKey(authSecret: string): Promise<string> {
+  return hmacSign(authSecret, SCOPED_TOKEN_KEY_CONTEXT);
+}
 
 async function hmacSign(secret: string, message: string): Promise<string> {
   const key = await crypto.subtle.importKey(
@@ -168,7 +192,7 @@ async function verifyScopedToken(
   if (!Number.isFinite(expiry) || Date.now() / 1000 > expiry) return null;
 
   const payload = `scoped:${tenantId}:${expiryStr}`;
-  const expectedHmac = await hmacSign(secret, payload);
+  const expectedHmac = await hmacSign(await deriveScopedTokenKey(secret), payload);
 
   if (!(await timingSafeEqual(expectedHmac, providedHmac))) return null;
   return { tenantId };
@@ -186,6 +210,6 @@ export async function createScopedToken(
 
   const expiry = Math.floor(Date.now() / 1000) + ttlSeconds;
   const payload = `scoped:${tenantId}:${expiry}`;
-  const hmac = await hmacSign(authSecret, payload);
+  const hmac = await hmacSign(await deriveScopedTokenKey(authSecret), payload);
   return `${payload}:${hmac}`;
 }

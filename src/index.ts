@@ -130,11 +130,15 @@ export default {
         return unauthorized(request);
       }
 
-      // ── Admin Routes (require admin token, not scoped tokens) ──────────────
+      // ── Admin Routes (require the current admin token, not scoped tokens) ──
 
       if (pathname.startsWith("/api/admin/")) {
-        if (auth.tenantScope) {
-          return forbidden(request, "Admin access requires an admin token");
+        // The previous token is accepted only for the rotation overlap of
+        // existing callers. Admin routes mint credentials and persist domain
+        // allowlists, so a token on its way out must not reach them: otherwise
+        // it could mint a current-signed scoped token that outlives removal.
+        if (auth.tenantScope || auth.credential === "previous") {
+          return forbidden(request, "Admin access requires the current admin token");
         }
         return handleAdminRoutes(request, env, url, method);
       }
